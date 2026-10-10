@@ -42,6 +42,15 @@ def edit(msg_id, text, buttons=None):
             raise
 
 
+def delete(msg_id):
+    """Delete one of the bot's own messages (Telegram allows this for 48h). Returns False if it could not."""
+    try:
+        _call("deleteMessage", {"chat_id": config.TG_CHAT, "message_id": msg_id})
+        return True
+    except Exception:
+        return False
+
+
 def answer_callback(cb_id, text=""):
     _call("answerCallbackQuery", {"callback_query_id": cb_id, "text": text[:200]})
 

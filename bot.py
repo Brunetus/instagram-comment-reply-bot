@@ -233,6 +233,24 @@ def process_comment(cm, m, label, fetched):
     flag_to_marcus(row, thread, label, m.get("caption") or "")
 
 
+def reconcile_open_cards():
+    """Every poll (Marcus, 2026-10-10): any open card whose comment he has since answered in the app is taken
+    off the Telegram queue, so a tap can never double-reply. Same live thread check as before a post."""
+    n = 0
+    for row in state.rows(status="flagged"):
+        if already_answered(row) is not True:
+            continue
+        state.update(row["id"], status="answered_manually", reason="Marcus replied in the app")
+        n += 1
+        if not tg.delete(row["tg_msg_id"]):   # older than 48h: collapse the card instead
+            try:
+                tg.edit(row["tg_msg_id"], f"✋ you already answered @{row['username']} in the app")
+            except Exception as e:
+                log("reconcile: card edit failed", repr(e))
+        log(f"reconcile: @{row['username']} answered in the app, card removed")
+    return n
+
+
 def settle_short_cards():
     """One-time pass at startup (Marcus, 2026-10-08): open cards whose comment now qualifies as a short
     reaction post themselves, same thread re-check as any post. Anything else stays a card."""
@@ -341,7 +359,7 @@ def sweep():
 # ---------- telegram handling ----------
 HELP = ("/status  followers + tracked reels + today's counts\n/digest  the full daily report, on demand\n"
         "/pause  stop reading and auto-posting (your taps and typed replies still post)\n/resume\n"
-        "/sweep  full-account catch-up now\n/cancel  forget the card you tapped Edit on\n/help")
+        "/sweep  full-account catch-up now\n/reconcile  drop open cards you already answered in the app\n/cancel  forget the card you tapped Edit on\n/help")
 
 
 def _paused():
@@ -488,6 +506,8 @@ def handle_update(u):
             state.set_kv("paused", "1"); tg.send("⏸ paused. No reading or auto-posting until /resume. Your taps and typed replies still post.")
         elif cmd == "/resume":
             state.set_kv("paused", "0"); tg.send("▶️ resumed.")
+        elif cmd == "/reconcile":
+            n = reconcile_open_cards(); tg.send(f"✋ {n} card(s) removed, you had answered those in the app." if n else "nothing to remove")
         elif cmd == "/cancel":
             tg.send("✖ edit cancelled" if _pending_edit() else "nothing to cancel"); _disarm_edit()
         elif cmd == "/status":
@@ -586,6 +606,7 @@ def main():
                 next_poll = time.time() + config.POLL_SECONDS
                 if not _paused():
                     poll_once()
+                    reconcile_open_cards()
             # 3) whole-account sweep every SWEEP_MINUTES
             if time.time() >= next_sweep:
                 next_sweep = time.time() + config.SWEEP_MINUTES * 60
