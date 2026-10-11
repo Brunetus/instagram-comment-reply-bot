@@ -151,7 +151,7 @@ def post_reply(cm, text, status):
 # ---------- telegram cards ----------
 def _card(cm, thread, label, d):
     head = f"💬 {label} · @{cm['username']}"
-    tail = [f"Draft: {d['reply']}"]
+    tail = ([f"🌐 In English: {d['translation']}"] if d.get("translation") else []) + [f"Draft: {d['reply']}"]
     if d.get("needs_marcus"):
         tail.append(f"⚠️ check: {d.get('note') or 'the draft may need a fact only you know'}")
     tail.append("Tap a button. Edit = then just type your text as the next message.")

@@ -34,9 +34,10 @@ HARD RULES (violating any of these is a failure):
   have, write the safest honest version and set needs_marcus=true with a one-line note.
 - Never give medical/legal/financial advice. Never mention competitors negatively by name beyond light banter.
 - Do not start with the commenter's @handle; the bot adds it when needed.
-- If the comment is in a language other than English, reply briefly in that language.
+- Always reply in English, whatever language the comment is in (Marcus, 2026-10-11). When the comment is not in
+  English, put a plain English translation of it in "translation" so Marcus can read it; otherwise leave it "".
 
-Return ONLY JSON: {"reply": "...", "needs_marcus": false, "note": ""}"""
+Return ONLY JSON: {"reply": "...", "needs_marcus": false, "note": "", "translation": ""}"""
 
 
 def _client():
@@ -115,8 +116,10 @@ def draft(cm, thread, caption, label):
                 if attempt == 0:
                     raise ValueError("sentence for a one-word comment: " + reply[:80])
                 reply = _mirror_emoji(cm.get("text"))   # second miss: mirror their emoji, never a sentence
-            return {"reply": reply, "needs_marcus": bool(out.get("needs_marcus")), "note": str(out.get("note") or "")[:200]}
+            return {"reply": reply, "needs_marcus": bool(out.get("needs_marcus")), "note": str(out.get("note") or "")[:200],
+                    "translation": str(out.get("translation") or "")[:300]}
         except Exception as e:
             last = e
             print(f"drafter attempt {attempt+1} failed for {cm.get('id')}: {type(e).__name__}: {str(e)[:200]}", flush=True)
-    return {"reply": "🙌", "needs_marcus": True, "note": f"drafter failed twice ({type(last).__name__}), fallback emoji"}
+    return {"reply": "🙌", "needs_marcus": True, "note": f"drafter failed twice ({type(last).__name__}), fallback emoji",
+            "translation": ""}
