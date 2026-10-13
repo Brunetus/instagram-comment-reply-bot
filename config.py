@@ -45,6 +45,7 @@ SWEEP_HOURS = int(env("SWEEP_HOURS", "48"))        # a sweep looks this far back
 POST_GAP_SECONDS = float(env("POST_GAP_SECONDS", "4"))
 
 # shortcode:label, same four as track_reels.py
-_FLAG_DEFAULT = ("DdQBUIRuSRM:one thing,DdIBRRKpDqn:sexiest thing,"
+# 2026-10-12 (Marcus): the localhost reel replaces "sexiest thing" (17 comments, quiet)
+_FLAG_DEFAULT = ("DdQBUIRuSRM:one thing,Dd-Ss2PI0PB:localhost to .com,"
                  "DddHvD5OgIa:question for the men,DdxZCCmR8i0:greenest flag")
 FLAGSHIP = dict(x.split(":", 1) for x in env("FLAGSHIP", _FLAG_DEFAULT).split(",") if x.strip())
