@@ -30,8 +30,12 @@ HARD RULES (violating any of these is a failure):
 - Never use an em dash (—). Use a period, comma or nothing.
 - Never promise a DM, a link, a file or "I'll send you". Never ask them to DM.
 - Never hide, mock, or argue with hostile comments. Disarm with humour or ask what they mean.
-- Never invent facts about Marcus (his setup, numbers, revenue, products). If a good reply would need one you do not
-  have, write the safest honest version and set needs_marcus=true with a one-line note.
+- Facts about the WORLD (whether a product or plan exists, what a tool does, prices of other tools, model names,
+  release dates): look them up with web_search before answering, never guess and never ask the commenter. Keep the
+  reply short and casual even when you searched; do not cite sources or URLs in the reply.
+- Never invent facts about MARCUS (his setup, numbers, revenue, products, what he pays). Those cannot be searched.
+  If a good reply needs one you do not have, write the safest honest version and set needs_marcus=true with a
+  one-line note. needs_marcus is ONLY for facts about Marcus, never for things web_search can answer.
 - Never give medical/legal/financial advice. Never mention competitors negatively by name beyond light banter.
 - Do not start with the commenter's @handle; the bot adds it when needed.
 - Always reply in English, whatever language the comment is in (Marcus, 2026-10-11). When the comment is not in
@@ -57,15 +61,23 @@ def _thread_text(thread, target_id):
 def _parse(txt):
     """Tolerant: clean JSON, then JSON inside prose, then a pattern match on the reply field, then bare text."""
     txt = txt.strip()
-    for cand in (txt, (re.search(r"\{.*\}", txt, re.S) or re.match(r"$", "")).group(0)):
-        if not cand:
-            continue
+    try:
+        out = json.loads(txt)
+        if isinstance(out, dict) and out.get("reply"):
+            return out
+    except ValueError:
+        pass
+    # JSON inside prose, possibly several objects (text before and after a web search): keep the LAST valid one
+    dec, found = json.JSONDecoder(), None
+    for m in re.finditer(r"\{", txt):
         try:
-            out = json.loads(cand)
-            if isinstance(out, dict) and out.get("reply"):
-                return out
+            out, _ = dec.raw_decode(txt[m.start():])
         except ValueError:
-            pass
+            continue
+        if isinstance(out, dict) and out.get("reply"):
+            found = out
+    if found:
+        return found
     m = re.search(r'"reply"\s*:\s*"(.*?)"\s*,\s*"needs_marcus"\s*:\s*(true|false)', txt, re.S)
     if m:
         return {"reply": m.group(1).replace('\\"', '"'), "needs_marcus": m.group(2) == "true", "note": "parsed loosely"}
@@ -75,6 +87,9 @@ def _parse(txt):
 
 
 _WORD = re.compile(r"[A-Za-z0-9']+")
+# a reply must read like a comment, never like a search result
+_LEAK = re.compile(r"https?://|www\.|\b[\w-]+\.(com|ai|io|org|net|dev|app|co)\b|\[\d+\]|\baccording to\b|"
+                   r"\bsources?\b|\bi (searched|looked (it )?up|googled)\b", re.I)
 _FIRST_EMOJI = re.compile(r"[\U0001F300-\U0001FAFF❤️🔥]")
 
 
@@ -91,7 +106,7 @@ def _mirror_emoji(text):
 
 def draft(cm, thread, caption, label):
     """Returns dict(reply, needs_marcus, note). Retries once, then falls back to a safe emoji (always flagged)."""
-    short = is_short(cm.get("text"))
+    short = is_short(re.sub(r"@[\w.]+", "", cm.get("text") or ""))   # mentions don't count as words
     user_msg = (f"REEL: {label}\nCAPTION: {caption[:300]}\n\nTHREAD (reply to the line marked >>):\n"
                 f"{_thread_text(thread, cm['id'])}\n\nWrite Marcus's reply.")
     if short:
@@ -104,14 +119,27 @@ def draft(cm, thread, caption, label):
         try:
             # thinking is always on for Opus/Sonnet 5.5 and counts against max_tokens, so leave headroom;
             # effort is set explicitly because Opus 5.5 defaults to medium and Sonnet 5.5 to high
-            r = _client().messages.create(model=config.DRAFT_MODEL, max_tokens=4096, system=system,
-                                          output_config={"effort": config.DRAFT_EFFORT},
-                                          messages=[{"role": "user", "content": user_msg}])
+            # web_search: Anthropic's server-side tool (Marcus, 2026-10-17: research instead of warning signs).
+            # Capped at WEB_SEARCHES per draft; ~1 cent a search. A long search can end a turn with
+            # pause_turn, in which case the conversation is simply continued.
+            tools = ([{"type": "web_search_20260209", "name": "web_search", "max_uses": config.WEB_SEARCHES}]
+                     if config.WEB_SEARCHES and not short else [])   # an emoji reply never needs a search
+            msgs = [{"role": "user", "content": user_msg}]
+            for _ in range(3):
+                r = _client().messages.create(model=config.DRAFT_MODEL, max_tokens=4096,
+                                              system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                                              output_config={"effort": config.DRAFT_EFFORT},
+                                              tools=tools, messages=msgs)
+                if r.stop_reason != "pause_turn":
+                    break
+                msgs = msgs + [{"role": "assistant", "content": r.content}]
             txt = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
             out = _parse(txt)
             reply = (out.get("reply") or "").strip().replace("—", ",")
             if not reply or len(reply) > 400:
                 raise ValueError("empty/long reply: " + txt[:120])
+            if _LEAK.search(reply):
+                raise ValueError("url/citation in reply: " + reply[:80])
             if short and (len(_WORD.findall(reply)) > 3 or "?" in reply):
                 if attempt == 0:
                     raise ValueError("sentence for a one-word comment: " + reply[:80])

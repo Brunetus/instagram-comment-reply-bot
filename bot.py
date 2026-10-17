@@ -180,8 +180,8 @@ def _card(cm, thread, label, d):
 _BUTTONS = [("✅ Approve", "ap"), ("✏️ Edit", "ed"), ("⏭ Skip", "sk")]
 
 
-def flag_to_marcus(cm, thread, label, caption, note=None):
-    d = draft.draft(cm, thread, caption, label)
+def flag_to_marcus(cm, thread, label, caption, note=None, pre=None):
+    d = pre or draft.draft(cm, thread, caption, label)   # pre: a draft already made for this comment
     if note:
         label = f"{label} {note}"
     msg_id = tg.send(_card(cm, thread, label, d), buttons=[[(l, f"{code}:{cm['id']}") for l, code in _BUTTONS]])
@@ -218,9 +218,10 @@ def process_comment(cm, m, label, fetched):
     row = state.get(cm["id"])
     if tier == "auto" and auto_text is None:   # short reaction: the drafter picks the word or emoji
         d = draft.draft(cm, thread, m.get("caption") or "", label)
-        if d["needs_marcus"]:   # drafter failed or wants a human: fail closed, card instead of post
-            state.update(cm["id"], tier="flag", reason=f"short draft: {d['note'][:80]}")
-            flag_to_marcus(state.get(cm["id"]), thread, label, m.get("caption") or "")
+        if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"]:
+            # drafter failed, wants a human, or wrote a sentence: fail closed, card instead of post
+            state.update(cm["id"], tier="flag", reason=f"short draft: {d['note'][:80] or 'too long to auto-post'}")
+            flag_to_marcus(state.get(cm["id"]), thread, label, m.get("caption") or "", pre=d)
             return
         auto_text = d["reply"]
     if tier == "auto":
@@ -269,7 +270,7 @@ def settle_short_cards():
         md = state.media(row["media_id"]) or {}
         if auto is None:
             d = draft.draft(cm, thread, md.get("caption") or "", md.get("label") or row["shortcode"])
-            if d["needs_marcus"]:
+            if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"]:
                 continue
             auto = d["reply"]
         rid = post_reply(row, auto, "auto_posted")
