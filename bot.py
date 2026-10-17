@@ -239,7 +239,20 @@ def reconcile_open_cards():
     off the Telegram queue, so a tap can never double-reply. Same live thread check as before a post."""
     n = 0
     for row in state.rows(status="flagged"):
-        if already_answered(row) is not True:
+        verdict = already_answered(row)
+        if verdict is None:
+            # the commenter deleted it? then there is nothing to answer, drop the card
+            try:
+                ig.comment(row["id"])
+                continue   # exists, just a transient fetch error: leave the card
+            except ig.IGError as e:
+                if "does not exist" not in str(e):
+                    continue
+            state.update(row["id"], status="deleted", reason="comment deleted by its author")
+            tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"🗑 @{row['username']} deleted their comment")
+            log(f"reconcile: @{row['username']} deleted their comment, card removed")
+            continue
+        if verdict is not True:
             continue
         state.update(row["id"], status="answered_manually", reason="Marcus replied in the app")
         n += 1
