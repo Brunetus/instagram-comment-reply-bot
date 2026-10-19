@@ -137,3 +137,69 @@ def cached_author(comment_id):
 def cache_author(comment_id, username):
     with _conn() as c:
         c.execute("INSERT OR REPLACE INTO authors(comment_id,username) VALUES(?,?)", (comment_id, username))
+
+
+# ---------- memory for the drafter (Marcus, 2026-10-19) ----------
+_HANDLE = r"^@[\w.]+\s*"
+
+
+def _strip_handle(t):
+    import re as _re
+    return _re.sub(_HANDLE, "", t or "").strip()
+
+
+def by_user(username, limit=12):
+    """This commenter's past comments (any reel) with Marcus's answer to each, oldest first. Marcus's replies are
+    matched by username (so comments recorded before the bot existed count too): the first reply by him in the
+    same thread after the comment that starts with @username, else the first one after it at all."""
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM comments WHERE username=? AND status NOT IN ('own','error','deleted') "
+                         "ORDER BY ts DESC LIMIT ?", (username, limit)).fetchall()
+        out = []
+        for r in rows:
+            r = dict(r)
+            reply = _strip_handle(r.get("reply_text")) if r.get("reply_text") else None
+            if not reply:
+                top = r.get("parent_id") or r["id"]
+                mine = c.execute("SELECT text FROM comments WHERE username='imabgold' AND (parent_id=? OR id=?) AND ts>? "
+                                 "ORDER BY ts", (top, top, r["ts"])).fetchall()
+                hit = next((m["text"] for m in mine if (m["text"] or "").lower().startswith(f"@{username.lower()}")), None)
+                reply = _strip_handle(hit or (mine[0]["text"] if mine else None)) or None
+            pending = r.get("status") in ("new", "flagged") and not reply
+            out.append({"id": r["id"], "ts": r["ts"], "shortcode": r.get("shortcode"), "text": r.get("text") or "",
+                        "reply": reply, "pending": pending})
+        return list(reversed(out))
+
+
+def recent_replies(limit=30):
+    """Marcus's latest replies: typed via Edit, approved drafts, and replies he posted by hand in the app
+    (own rows that are NOT a reply the bot itself posted), each with the comment it answered. Newest first."""
+    with _conn() as c:
+        out = []
+        for r in c.execute("SELECT username, text, reply_text, status, updated_at AS t FROM comments WHERE status IN "
+                           "('edited_posted','approved_posted') AND reply_text IS NOT NULL ORDER BY updated_at DESC LIMIT ?",
+                           (limit,)).fetchall():
+            out.append({"t": r["t"] or 0, "comment": r["text"] or "", "reply": _strip_handle(r["reply_text"]), "how": r["status"]})
+        own = c.execute("""SELECT o.text AS reply, o.ts, o.created_at AS t,
+                             (SELECT p.text FROM comments p WHERE p.username<>'imabgold' AND p.ts<o.ts
+                                AND (p.parent_id=o.parent_id OR p.id=o.parent_id) ORDER BY p.ts DESC LIMIT 1) AS comment
+                           FROM comments o WHERE o.status='own' AND o.parent_id IS NOT NULL
+                             AND o.id NOT IN (SELECT reply_id FROM comments WHERE reply_id IS NOT NULL)
+                           ORDER BY o.ts DESC LIMIT ?""", (limit,)).fetchall()
+        out += [{"t": r["t"] or 0, "comment": r["comment"] or "", "reply": _strip_handle(r["reply"]), "how": "by hand"}
+                for r in own if r["reply"]]
+        out.sort(key=lambda x: -x["t"])
+        return out[:limit]
+
+
+def corrections(limit=12):
+    """Cards where Marcus rewrote the draft (ignoring a leading @handle): (comment, drafted, posted)."""
+    with _conn() as c:
+        rows = c.execute("SELECT username, text, draft, reply_text FROM comments WHERE status='edited_posted' AND draft IS NOT NULL "
+                         "AND reply_text IS NOT NULL ORDER BY updated_at DESC LIMIT ?", (limit * 2,)).fetchall()
+        out = []
+        for r in rows:
+            d, p_ = _strip_handle(r["draft"]), _strip_handle(r["reply_text"])
+            if d and p_ and d != p_:
+                out.append({"comment": r["text"] or "", "draft": d, "posted": p_})
+        return out[:limit]

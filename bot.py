@@ -218,8 +218,8 @@ def process_comment(cm, m, label, fetched):
     row = state.get(cm["id"])
     if tier == "auto" and auto_text is None:   # short reaction: the drafter picks the word or emoji
         d = draft.draft(cm, thread, m.get("caption") or "", label)
-        if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"]:
-            # drafter failed, wants a human, or wrote a sentence: fail closed, card instead of post
+        if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"] or "@" in d["reply"]:
+            # drafter failed, wants a human, wrote a sentence or tagged someone: fail closed, card instead of post
             state.update(cm["id"], tier="flag", reason=f"short draft: {d['note'][:80] or 'too long to auto-post'}")
             flag_to_marcus(state.get(cm["id"]), thread, label, m.get("caption") or "", pre=d)
             return
@@ -283,7 +283,7 @@ def settle_short_cards():
         md = state.media(row["media_id"]) or {}
         if auto is None:
             d = draft.draft(cm, thread, md.get("caption") or "", md.get("label") or row["shortcode"])
-            if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"]:
+            if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"] or "@" in d["reply"]:
                 continue
             auto = d["reply"]
         rid = post_reply(row, auto, "auto_posted")

@@ -32,7 +32,7 @@ TG_CHAT = str(env("TELEGRAM_CHAT_ID", ""))
 
 ANTHROPIC_KEY = env("ANTHROPIC_API_KEY", "")
 DRAFT_MODEL = env("DRAFT_MODEL", "claude-opus-5-5")
-DRAFT_EFFORT = env("DRAFT_EFFORT", "medium")
+DRAFT_EFFORT = env("DRAFT_EFFORT", "high")   # 2026-10-19: API credits are included with Max, so think harder
 WEB_SEARCHES = int(env("WEB_SEARCHES", "2"))   # web searches the drafter may run per draft; 0 disables
 
 DATA_DIR = env("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))

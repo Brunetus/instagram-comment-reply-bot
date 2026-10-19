@@ -4,3 +4,5 @@ __pycache__/
 .env
 .env.*
 !.env.example
+# other people's comments, built by build_history.py, shipped in the image only
+history.json
