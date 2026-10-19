@@ -88,8 +88,9 @@ def _parse(txt):
 
 _WORD = re.compile(r"[A-Za-z0-9']+")
 # a reply must read like a comment, never like a search result
+# ("open source" is normal speech, so only "source:" / "sources:" count as a citation)
 _LEAK = re.compile(r"https?://|www\.|\b[\w-]+\.(com|ai|io|org|net|dev|app|co)\b|\[\d+\]|\baccording to\b|"
-                   r"\bsources?\b|\bi (searched|looked (it )?up|googled)\b", re.I)
+                   r"\bsources?\s*:|\bi (searched|looked (it )?up|googled)\b", re.I)
 _FIRST_EMOJI = re.compile(r"[\U0001F300-\U0001FAFF❤️🔥]")
 
 
