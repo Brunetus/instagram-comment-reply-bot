@@ -25,7 +25,8 @@ Files: `bot.py` loop · `classify.py` tiers · `draft.py` Sonnet · `ig.py` Grap
    - Redeploy once after adding variables.
 5. Telegram should say "🤖 bot online". Send `/status`.
 
-Updates later: edit the code, `railway up` again from `src/bot/`.
+Updates later: edit the code, then from `src/bot`: `python3 build_history.py && railway up --service imabgold-bot --no-gitignore`.
+`--no-gitignore` matters: `history.json` (other people's comments, built from the comment dumps) is gitignored so it never reaches the public repo, but it must ship in the image; `.dockerignore` governs the upload.
 
 ## Rehearsal before deploy (no posting, no Telegram)
 ```bash
