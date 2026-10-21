@@ -57,8 +57,13 @@ HARD RULES (violating any of these is a failure):
 - Do not start with the commenter's @handle; the bot adds it when needed.
 - Always reply in English, whatever language the comment is in (Marcus, 2026-10-11). When the comment is not in
   English, put a plain English translation of it in "translation" so Marcus can read it; otherwise leave it "".
+- "explainer" (Marcus, 2026-10-21): if the comment uses jargon, acronyms, product names or hardware Marcus may not
+  know (he is an accountant who builds iOS apps with Claude Code, not a sysadmin or ML engineer), write ONE plain
+  English sentence, max 40 words, saying what the person is actually talking about, e.g. "He runs his own
+  speech-to-text on a small home server with gaming graphics cards instead of paying for Wispr." Leave it "" when
+  the comment is plain.
 
-Return ONLY JSON: {"reply": "...", "needs_marcus": false, "note": "", "translation": ""}"""
+Return ONLY JSON: {"reply": "...", "needs_marcus": false, "note": "", "translation": "", "explainer": ""}"""
 
 
 def _client():
@@ -218,9 +223,9 @@ def draft(cm, thread, caption, label):
                     raise ValueError("sentence for a one-word comment: " + reply[:80])
                 reply = _mirror_emoji(cm.get("text"))   # second miss: mirror their emoji, never a sentence
             return {"reply": reply, "needs_marcus": bool(out.get("needs_marcus")), "note": str(out.get("note") or "")[:200],
-                    "translation": str(out.get("translation") or "")[:300]}
+                    "translation": str(out.get("translation") or "")[:300], "explainer": str(out.get("explainer") or "")[:320]}
         except Exception as e:
             last = e
             print(f"drafter attempt {attempt+1} failed for {cm.get('id')}: {type(e).__name__}: {str(e)[:200]}", flush=True)
     return {"reply": "🙌", "needs_marcus": True, "note": f"drafter failed twice ({type(last).__name__}), fallback emoji",
-            "translation": ""}
+            "translation": "", "explainer": ""}
