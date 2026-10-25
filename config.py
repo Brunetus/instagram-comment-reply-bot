@@ -40,6 +40,11 @@ POLL_SECONDS = int(env("POLL_SECONDS", "600"))
 TZ = env("TZ", "America/Los_Angeles")
 DIGEST_HOUR = int(env("DIGEST_HOUR", "9"))
 AUTO_POST = env("AUTO_POST", "0") == "1"          # default shadow; set AUTO_POST=1 on Railway to post the auto tier
+AUTO_DRAFT = env("AUTO_DRAFT", "0") == "1"        # 2026-10-25: drafts that pass the critic post themselves (Marcus)
+MIN_AUTO_GAP = float(env("MIN_AUTO_GAP", "30"))   # seconds between two auto-posted drafts, the only volume guard
+CATCHUP_SINCE = env("CATCHUP_SINCE", "2026-10-01")   # unanswered comments this recent get worked through after each poll
+CATCHUP_PER_POLL = int(env("CATCHUP_PER_POLL", "3"))
+CATCHUP_SECONDS = int(env("CATCHUP_SECONDS", "120"))   # wall-clock cap per poll so Telegram taps are never starved
 NEWEST_N = int(env("NEWEST_N", "3"))
 SWEEP_MINUTES = int(env("SWEEP_MINUTES", "60"))    # every reel on the account is swept this often (hot 7 are every POLL_SECONDS)
 SWEEP_HOURS = int(env("SWEEP_HOURS", "48"))        # a sweep looks this far back on each reel

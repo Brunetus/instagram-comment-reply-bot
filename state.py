@@ -117,12 +117,13 @@ def by_tg_msg(msg_id):
         return _d(c.execute("SELECT * FROM comments WHERE tg_msg_id=?", (msg_id,)).fetchone())
 
 
-def rows(status=None, since=None):
+def rows(status=None, since=None, by="updated_at"):
+    """since: epoch seconds, compared against updated_at by default (the catch-up works on old rows)."""
     q, p = "SELECT * FROM comments WHERE 1=1", []
     if status:
         q += " AND status=?"; p.append(status)
     if since:
-        q += " AND created_at>=?"; p.append(since)
+        q += f" AND {by}>=?"; p.append(since)
     q += " ORDER BY created_at"
     with _conn() as c:
         return [_d(r) for r in c.execute(q, p).fetchall()]
@@ -203,3 +204,36 @@ def corrections(limit=12):
             if d and p_ and d != p_:
                 out.append({"comment": r["text"] or "", "draft": d, "posted": p_})
         return out[:limit]
+
+
+def replies_on_media(media_id, limit=20):
+    """The latest replies that went out under this reel (any path), newest first: the critic's repetition check."""
+    with _conn() as c:
+        rows = c.execute("SELECT reply_text FROM comments WHERE media_id=? AND reply_text IS NOT NULL AND status IN "
+                         "('auto_posted','auto_drafted','approved_posted','edited_posted') ORDER BY updated_at DESC LIMIT ?",
+                         (media_id, limit)).fetchall()
+        return [_strip_handle(r["reply_text"]) for r in rows]
+
+
+def thread_answered_by_hand(top_id):
+    """True if Marcus himself (not the bot) has replied somewhere in this thread: he is handling it, keep it his."""
+    with _conn() as c:
+        r = c.execute("SELECT 1 FROM comments o WHERE o.username='imabgold' AND (o.parent_id=? OR o.id=?) "
+                      "AND o.id NOT IN (SELECT reply_id FROM comments WHERE reply_id IS NOT NULL) LIMIT 1",
+                      (top_id, top_id)).fetchone()
+        return r is not None
+
+
+def backlog(since, limit):
+    """Comments the bot never answered: open cards and comments recorded at first sight, newest first."""
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM comments WHERE (status='preexisting' OR (status='flagged' AND needs_marcus=0)) "
+                         "AND username<>'imabgold' AND ts>=? ORDER BY ts DESC LIMIT ?", (since, limit)).fetchall()
+        return [_d(r) for r in rows]
+
+
+def is_bot_reply(reply_id):
+    """True if this reply id is one the bot posted (any path): approved, edited, auto."""
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM comments WHERE reply_id=? LIMIT 1", (reply_id,)).fetchone() is not None
+

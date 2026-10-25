@@ -42,7 +42,9 @@ def _u16(s):
 # ---------- content rules (invariant: enforced in code, not just in the prompt) ----------
 _FORBIDDEN = re.compile(r"—|zero cod(e|ing)|no coding background|can'?t (read |write )?code|cannot code|non-? ?technical|"
                         r"never written a line|don'?t (know how to )?code|i'?ll (dm|send|email|message)|dm'?e?d you|dm me|dm you|"
-                        r"check your dm|sent you|sending you|message me|inbox me|link below|link in bio", re.I)
+                        r"check your dm|sent you|sending you|message me|inbox me|link below|link in bio|"
+                        r"\b(i will|i can|let me|gonna|going to)\s+(dm|send|email|message|share|drop|shoot)\b|"
+                        r"i'?ll (share|drop|shoot|post the link)|\bin (your|the) dms?\b", re.I)
 
 
 def content_violation(text):
@@ -179,6 +181,82 @@ def _card(cm, thread, label, d):
 
 
 _BUTTONS = [("✅ Approve", "ap"), ("✏️ Edit", "ed"), ("⏭ Skip", "sk")]
+_LEAD = re.compile(r"^\W*(money)\W*$", re.I)   # comment keywords that mean "send me the thing": always Marcus's
+_CRUDE = re.compile(r"\b(fuck\w*|shit\w*|sexy|daddy|kys|fraud|scam\w*|garbage|who asked|bitch\w*|retard\w*|rape|nazi|jew\w*|"
+                    r"gay|tranny|slut|whore|porn\w*|onlyfans|nude\w*)\b", re.I)   # a human decides these, never the critic alone
+_LAST_AUTO = [0.0]
+
+
+def _posted_card(cm, thread, label, d, posted, why, edit_msg_id=None):
+    """The same card as a flag, but the bottom reads 🤖 posted. Replaces the old card when one exists."""
+    dd = dict(d); dd["reply"] = posted; dd["needs_marcus"] = False
+    txt = _card(cm, thread, label, dd).replace(f"Draft: {posted}", f"🤖 posted: {posted}") \
+        .replace("\nTap a button. Edit = then just type your text as the next message.", f"\n({why})")
+    try:
+        if edit_msg_id:
+            tg.edit(edit_msg_id, txt)
+            return edit_msg_id
+        return tg.send(txt)
+    except Exception as e:
+        log("posted card failed", repr(e))
+        return None
+
+
+def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
+    """The flag tier since 2026-10-25: draft, let the critic judge, post on its own or hand Marcus a card."""
+    caption = m.get("caption") or ""
+    d = draft.draft(cm, thread, caption, label)
+    text = cm.get("text") or ""
+    top_id = cm.get("parent_id") or cm["id"]
+    if not config.AUTO_DRAFT:   # tier off: plain card, NOT marked as a hold, so it is caught up once the tier is on
+        if not edit_msg_id:
+            flag_to_marcus(row, thread, label, caption, pre=d)
+        else:
+            state.update(cm["id"], status="flagged")
+        return
+    stripped = classify._MENTION.sub("", text)
+    by_hand = any((c.get("from") or {}).get("username") in (ME, "?", None) and c["id"] != cm["id"]
+                  and not state.is_bot_reply(c["id"]) for c in thread)   # a reply of his the bot did not post
+    hold = None
+    if d["needs_marcus"]:
+        hold = f"needs you: {d.get('note') or 'a fact only you know'}"
+    elif _LEAD.match(text):
+        hold = "lead keyword"
+    elif row.get("reason") == "emoji outside the allow-list":
+        hold = "emoji outside the allow-list"
+    elif classify._NEG.search(stripped) or _CRUDE.search(stripped):
+        hold = "negative, hostile or crude wording"
+    elif by_hand or state.thread_answered_by_hand(top_id):
+        hold = "you are handling this thread yourself"
+    elif "@" in d["reply"]:
+        hold = "draft tags someone"
+    if hold:
+        if edit_msg_id:   # an old card: keep it, it already has buttons
+            state.update(cm["id"], status="flagged", needs_marcus=1, reason=hold)
+            return
+        flag_to_marcus(row, thread, label, caption, pre=d, note=f"({hold})")
+        return
+    v = draft.critique(cm, thread, d["reply"], caption, label, state.replies_on_media(m["id"]))
+    if v["verdict"] == "flag":
+        if edit_msg_id:
+            state.update(cm["id"], status="flagged", needs_marcus=1, reason=f"critic: {v['reason']}")
+            return
+        flag_to_marcus(row, thread, label, caption, pre=d, note=f"(critic: {v['reason']})")
+        return
+    wait = config.MIN_AUTO_GAP - (time.time() - _LAST_AUTO[0])
+    if wait > 0:
+        time.sleep(wait)
+    rid = post_reply(row, v["reply"], "auto_drafted")
+    _LAST_AUTO[0] = time.time()
+    if rid:
+        why = "critic rewrote the draft" if v["verdict"] == "rewrite" else "critic approved the draft"
+        mid = _posted_card(row, thread, label, d, v["reply"], why, edit_msg_id=edit_msg_id)
+        if mid:
+            state.update(cm["id"], tg_msg_id=mid)
+        return
+    after = state.get(cm["id"])
+    if after and after["status"] == "flagged" and not edit_msg_id:   # blocked text or a glitch: a human decides
+        flag_to_marcus(row, thread, label, caption, pre=d, note=f"({after.get('reason') or 'could not post'})")
 
 
 def flag_to_marcus(cm, thread, label, caption, note=None, pre=None):
@@ -186,8 +264,8 @@ def flag_to_marcus(cm, thread, label, caption, note=None, pre=None):
     if note:
         label = f"{label} {note}"
     msg_id = tg.send(_card(cm, thread, label, d), buttons=[[(l, f"{code}:{cm['id']}") for l, code in _BUTTONS]])
-    state.update(cm["id"], status="flagged", draft=d["reply"], needs_marcus=int(d["needs_marcus"]),
-                 tg_msg_id=msg_id, reason=(note or d.get("note")))
+    state.update(cm["id"], status="flagged", draft=d["reply"], needs_marcus=int(bool(d["needs_marcus"] or note)),
+                 tg_msg_id=msg_id, reason=(note or d.get("note")))   # a note = a hold: the catch-up must not redraft it
     log(f"flagged -> card {msg_id}: @{cm['username']} \"{(cm.get('text') or '')[:50]}\" draft: {d['reply'][:60]}")
 
 
@@ -217,6 +295,10 @@ def process_comment(cm, m, label, fetched):
         return
     state.add_comment(cm, m["id"], m["shortcode"], tier, "new", reason=reason)
     row = state.get(cm["id"])
+    if _LEAD.match(cm.get("text") or ""):   # "money" etc: a lead, never an emoji, always Marcus (2026-10-10 lesson)
+        flag_to_marcus(row, thread, label, m.get("caption") or "", note="(🎯 lead keyword, DM them the guide by hand)")
+        state.update(cm["id"], tier="flag", needs_marcus=1, reason="lead keyword")   # after the card: flag_to_marcus resets needs_marcus
+        return
     if tier == "auto" and auto_text is None:   # short reaction: the drafter picks the word or emoji
         d = draft.draft(cm, thread, m.get("caption") or "", label)
         if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"] or "@" in d["reply"]:
@@ -232,7 +314,92 @@ def process_comment(cm, m, label, fetched):
             state.update(cm["id"], reply_text=auto_text)
             flag_to_marcus(row, thread, label, m.get("caption") or "", note=f"(shadow: would auto-post {auto_text})")
         return
-    flag_to_marcus(row, thread, label, m.get("caption") or "")
+    auto_or_flag(row, cm, thread, m, label)
+
+
+def catchup_unanswered():
+    """After each poll (Marcus, 2026-10-25): work through comments the bot never answered, newest first, a few at a
+    time: open cards and comments recorded at first sight since CATCHUP_SINCE. Each one is checked live first."""
+    n = 0
+    t0 = time.time()
+    pe = _pending_edit()
+    for row in state.backlog(config.CATCHUP_SINCE, config.CATCHUP_PER_POLL):
+        if time.time() - t0 > config.CATCHUP_SECONDS:
+            break
+        if pe and pe.get("cid") == row["id"]:   # Marcus is typing a reply for this one right now
+            continue
+        try:
+            n += _catchup_one(row)
+        except Exception as e:
+            log(f"catchup: error on @{row['username']} {row['id']}: {e!r}")
+            if (state.get(row["id"]) or {}).get("status") in ("new", "preexisting", "flagged"):
+                state.update(row["id"], status="error", reason=f"catchup: {str(e)[:150]}")
+    if n:
+        log(f"catchup: worked through {n} unanswered comments")
+    return n
+
+
+def _catchup_one(row):
+    """One backlog row. Returns 1 when it was acted on, 0 when it was only re-filed."""
+    cm = {"id": row["id"], "text": row["text"], "timestamp": row["timestamp"],
+          "from": {"username": row["username"]}, "parent_id": row.get("parent_id")}
+    top_id = row.get("parent_id") or row["id"]
+    if True:
+        try:
+            thread = thread_of(top_id)
+        except ig.IGError as e:
+            if "does not exist" in str(e):
+                state.update(row["id"], status="deleted", reason="comment gone")
+                if row.get("tg_msg_id"):
+                    tg.delete(row["tg_msg_id"])
+            else:
+                log(f"catchup: skipping @{row['username']}: {e}")
+            return 0
+        if any((c.get("from") or {}).get("username") == ME and c["timestamp"] > row["timestamp"] for c in thread):
+            state.update(row["id"], status="answered_manually", reason="already answered")
+            if row.get("tg_msg_id"):
+                tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"✋ already answered @{row['username']}")
+            return 0
+        if not any(c["id"] == cm["id"] for c in thread):
+            thread.append(cm); thread.sort(key=lambda c: c["timestamp"])
+        md = state.media(row["media_id"]) or {}
+        m = {"id": row["media_id"], "shortcode": row["shortcode"], "caption": md.get("caption") or ""}
+        label = md.get("label") or row["shortcode"]
+        if _LEAD.match(cm.get("text") or ""):
+            if not row.get("tg_msg_id"):
+                flag_to_marcus(state.get(row["id"]), thread, label, m["caption"], note="(🎯 lead keyword, DM them the guide by hand)")
+            state.update(row["id"], status="flagged", tier="flag", needs_marcus=1, reason="lead keyword")
+            return 0
+        tier, reason, auto_text = classify.classify(cm, thread)
+        if tier in ("skip", "signoff"):
+            state.update(row["id"], status="skipped" if tier == "skip" else "signoff", tier=tier, reason=reason)
+            if row.get("tg_msg_id"):
+                tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"⏭ {reason}: @{row['username']}")
+            return 0
+        state.update(row["id"], tier=tier, status="new", reason=reason)
+        fresh = state.get(row["id"])
+        if tier == "auto":
+            if auto_text is None:
+                d = draft.draft(cm, thread, m["caption"], label)
+                if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"] or "@" in d["reply"]:
+                    if not row.get("tg_msg_id"):
+                        flag_to_marcus(state.get(row["id"]), thread, label, m["caption"], pre=d)
+                    state.update(row["id"], status="flagged", tier="flag", needs_marcus=1, reason="short draft needs a look")
+                    return 0
+                auto_text = d["reply"]
+            if not config.AUTO_POST:   # shadow mode: never post the auto tier from the backlog either
+                state.update(row["id"], status="flagged", needs_marcus=1, reason="auto tier in shadow")
+                return 0
+            rid = post_reply(fresh, auto_text, "auto_posted")
+            if rid and row.get("tg_msg_id"):
+                tg.edit(row["tg_msg_id"], f"🤖 posted to @{row['username']}: {auto_text}")
+            elif not rid and not row.get("tg_msg_id") and (state.get(row["id"]) or {}).get("status") == "flagged":
+                flag_to_marcus(state.get(row["id"]), thread, label, m["caption"], note="(could not auto-post)")
+        else:
+            auto_or_flag(fresh, cm, thread, m, label, edit_msg_id=row.get("tg_msg_id"))
+            if state.get(row["id"])["status"] == "new":   # a hold on an old card: leave the card as it was
+                state.update(row["id"], status="flagged")
+        return 1
 
 
 def reconcile_open_cards():
@@ -250,13 +417,16 @@ def reconcile_open_cards():
                 if "does not exist" not in str(e):
                     continue
             state.update(row["id"], status="deleted", reason="comment deleted by its author")
-            tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"🗑 @{row['username']} deleted their comment")
+            if row.get("tg_msg_id"):
+                tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"🗑 @{row['username']} deleted their comment")
             log(f"reconcile: @{row['username']} deleted their comment, card removed")
             continue
         if verdict is not True:
             continue
         state.update(row["id"], status="answered_manually", reason="Marcus replied in the app")
         n += 1
+        if not row.get("tg_msg_id"):
+            continue
         if not tg.delete(row["tg_msg_id"]):   # older than 48h: collapse the card instead
             try:
                 tg.edit(row["tg_msg_id"], f"✋ you already answered @{row['username']} in the app")
@@ -393,10 +563,10 @@ def _status_text():
             lines.append(f"{label}: insights unavailable")
     day = time.time() - 86400
     c = {s: len(state.rows(status=s, since=day)) for s in
-         ("auto_posted", "flagged", "approved_posted", "edited_posted", "declined", "skipped", "signoff",
+         ("auto_posted", "auto_drafted", "flagged", "approved_posted", "edited_posted", "declined", "skipped", "signoff",
           "answered_manually", "error")}
     waiting = len(state.rows(status="flagged"))
-    lines += ["", f"Last 24h: auto {c['auto_posted']} · approved {c['approved_posted']} · edited {c['edited_posted']} · "
+    lines += ["", f"Last 24h: auto emoji {c['auto_posted']} · auto drafts {c['auto_drafted']} · approved {c['approved_posted']} · edited {c['edited_posted']} · "
                   f"declined {c['declined']} · skipped {c['skipped']+c['signoff']} · you beat me to {c['answered_manually']}"
                   + (f" · errors {c['error']}" if c['error'] else ""),
               f"Waiting on you: {waiting} · Auto-post: {'ON' if config.AUTO_POST else 'shadow'} · Paused: {_paused()}"]
@@ -569,6 +739,10 @@ def digest():
     errors = state.rows(status="error", since=day)
     waiting = state.rows(status="flagged")
     lines = ["☀️ Daily digest", "", _status_text(), ""]
+    drafted = state.rows(status="auto_drafted", since=day)
+    if drafted:
+        lines.append(f"Auto-drafted and posted ({len(drafted)}):")
+        lines += [f"  @{r['username']}: \"{(r['text'] or '')[:40]}\" → {r['reply_text']}" for r in drafted[-40:]]
     if auto:
         lines.append(f"Auto-posted ({len(auto)}):")
         lines += [f"  @{r['username']}: \"{(r['text'] or '')[:40]}\" → {r['reply_text']}" for r in auto[-25:]]
@@ -593,7 +767,7 @@ def main():
         _disarm_edit()   # never carry an armed Edit across a restart
     except Exception as e:
         log("startup disarm failed", repr(e))
-    log(f"bot up · auto_post={config.AUTO_POST} · model={config.DRAFT_MODEL} · tz={config.TZ}")
+    log(f"bot up · auto_post={config.AUTO_POST} · auto_draft={config.AUTO_DRAFT} · model={config.DRAFT_MODEL} · tz={config.TZ}")
     if config.AUTO_POST and state.get_kv("settled_short_cards") != "2026-10-08":
         state.set_kv("settled_short_cards", "2026-10-08")   # once, even if the pass itself errors out
         try:
@@ -622,6 +796,7 @@ def main():
                 if not _paused():
                     poll_once()
                     reconcile_open_cards()
+                    catchup_unanswered()
             # 3) whole-account sweep every SWEEP_MINUTES
             if time.time() >= next_sweep:
                 next_sweep = time.time() + config.SWEEP_MINUTES * 60
