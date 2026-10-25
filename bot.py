@@ -107,7 +107,8 @@ def already_answered(cm):
     try:
         thread = thread_of(top_id)
     except ig.IGError as e:
-        log("guard: could not fetch thread:", e)
+        _LAST_GUARD_ERR[0] = str(e)
+        log("guard: could not fetch thread:", str(e)[:160])
         return None
     for c in thread:
         if c["id"] == cm["id"]:
@@ -185,6 +186,7 @@ _LEAD = re.compile(r"^\W*(money)\W*$", re.I)   # comment keywords that mean "sen
 _CRUDE = re.compile(r"\b(fuck\w*|shit\w*|sexy|daddy|kys|fraud|scam\w*|garbage|who asked|bitch\w*|retard\w*|rape|nazi|jew\w*|"
                     r"gay|tranny|slut|whore|porn\w*|onlyfans|nude\w*)\b", re.I)   # a human decides these, never the critic alone
 _LAST_AUTO = [0.0]
+_LAST_GUARD_ERR = [""]
 
 
 def _posted_card(cm, thread, label, d, posted, why, edit_msg_id=None):
@@ -330,6 +332,8 @@ def catchup_unanswered():
             continue
         try:
             n += _catchup_one(row)
+        except RateLimited:
+            log("catchup: Instagram rate limit hit, resuming next poll"); break
         except Exception as e:
             log(f"catchup: error on @{row['username']} {row['id']}: {e!r}")
             if (state.get(row["id"]) or {}).get("status") in ("new", "preexisting", "flagged"):
@@ -337,6 +341,10 @@ def catchup_unanswered():
     if n:
         log(f"catchup: worked through {n} unanswered comments")
     return n
+
+
+class RateLimited(Exception):
+    pass
 
 
 def _catchup_one(row):
@@ -353,7 +361,9 @@ def _catchup_one(row):
                 if row.get("tg_msg_id"):
                     tg.delete(row["tg_msg_id"])
             else:
-                log(f"catchup: skipping @{row['username']}: {e}")
+                log(f"catchup: skipping @{row['username']}: {str(e)[:120]}")
+                if _rate_limited(e):
+                    raise RateLimited()
             return 0
         if any((c.get("from") or {}).get("username") == ME and c["timestamp"] > row["timestamp"] for c in thread):
             state.update(row["id"], status="answered_manually", reason="already answered")
@@ -402,12 +412,26 @@ def _catchup_one(row):
         return 1
 
 
+def _rate_limited(e):
+    return "request limit" in str(e).lower() or '"code":4,' in str(e) or '"code": 4,' in str(e)
+
+
 def reconcile_open_cards():
     """Every poll (Marcus, 2026-10-10): any open card whose comment he has since answered in the app is taken
     off the Telegram queue, so a tap can never double-reply. Same live thread check as before a post."""
     n = 0
+    if int(state.get_kv("poll_no", "0")) % 3:   # every third poll (30 min): the tap-time guard still protects every post
+        return 0
+    week = time.time() - 7 * 86400
     for row in state.rows(status="flagged"):
-        verdict = already_answered(row)
+        if (row.get("created_at") or 0) < week:   # old cards are not worth two API calls every half hour
+            continue
+        try:
+            verdict = already_answered(row)
+        except Exception as e:
+            log("reconcile: stopped:", repr(e)[:120]); break
+        if verdict is None and _rate_limited(_LAST_GUARD_ERR[0]):
+            log("reconcile: Instagram rate limit hit, resuming next time"); break
         if verdict is None:
             # the commenter deleted it? then there is nothing to answer, drop the card
             try:
@@ -794,6 +818,7 @@ def main():
             if time.time() >= next_poll:
                 next_poll = time.time() + config.POLL_SECONDS
                 if not _paused():
+                    state.set_kv("poll_no", int(state.get_kv("poll_no", "0")) + 1)
                     poll_once()
                     reconcile_open_cards()
                     catchup_unanswered()
