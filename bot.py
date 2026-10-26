@@ -418,7 +418,7 @@ def _catchup_one(row):
                     tg.delete(row["tg_msg_id"])
             else:
                 log(f"catchup: skipping @{row['username']}: {str(e)[:120]}")
-                if _rate_limited(e):
+                if _rate_limited(e) and not _node_limited(e):   # a throttled single comment just waits its cooldown
                     raise RateLimited()
             return 0
         if any((c.get("from") or {}).get("username") == ME and c["timestamp"] > row["timestamp"] for c in thread):
@@ -486,7 +486,7 @@ def reconcile_open_cards():
             verdict = already_answered(row)
         except Exception as e:
             log("reconcile: stopped:", repr(e)[:120]); break
-        if verdict is None and _rate_limited(_LAST_GUARD_ERR[0]):
+        if verdict is None and _rate_limited(_LAST_GUARD_ERR[0]) and not _node_limited(_LAST_GUARD_ERR[0]):
             log("reconcile: Instagram rate limit hit, resuming next time"); break
         if verdict is None:
             # the commenter deleted it? then there is nothing to answer, drop the card
