@@ -14,8 +14,26 @@ class IGError(Exception):
     pass
 
 
+# Circuit breaker (2026-10-26): when Instagram throttles comment objects ("Application request limit reached",
+# code 4), EVERY comment-node call fails app-wide, and each further attempt keeps the window full. So after the first
+# throttle, comment-node calls are not attempted at all for BLOCK_SECONDS; reel-level edges keep working.
+BLOCK_SECONDS = 45 * 60
+_BLOCK = {"until": 0.0}
+
+
+def comments_blocked():
+    return time.time() < _BLOCK["until"]
+
+
+def _is_throttle(msg):
+    return '"code":4' in msg.replace(" ", "") or "request limit reached" in msg.lower()
+
+
 def _call(path, params, data=None):
     params = dict(params or {})
+    node_call = not path.startswith(str(config.IG_USER_ID)) and "/insights" not in path and "/comments" not in path
+    if node_call and comments_blocked():
+        raise IGError(f"HTTP 403 on {path}: comment calls paused, Instagram request limit reached (breaker)")
     params["access_token"] = config.IG_TOKEN
     url = f"{BASE}/{path}?{urllib.parse.urlencode(params)}"
     body = urllib.parse.urlencode(data).encode() if data else None
@@ -30,6 +48,8 @@ def _call(path, params, data=None):
         except urllib.error.HTTPError as e:
             msg = e.read().decode(errors="replace")[:300]
             last = IGError(f"HTTP {e.code} on {path}: {msg}")
+            if node_call and _is_throttle(msg):
+                _BLOCK["until"] = time.time() + BLOCK_SECONDS
             if e.code in (400, 403, 404):   # not transient (or a rate limit): retrying only deepens it
                 raise last
         except Exception as e:  # timeouts, connection resets

@@ -178,6 +178,11 @@ def post_reply(cm, text, status):
         state.update(cm["id"], status="flagged", reason=f"blocked: contains '{bad}'")
         log(f"blocked reply to @{cm['username']} (contains '{bad}')")
         return None
+    if ig.comments_blocked():
+        _queue_retry(cm["id"], text, status)
+        state.update(cm["id"], status="flagged", reason="queued: Instagram has paused replies for the account for a "
+                                                         "while, the bot will post it automatically when it clears")
+        return None
     verdict = already_answered(cm)
     if verdict is None:
         # transient: keep the card live so Marcus can simply tap again
@@ -199,8 +204,8 @@ def post_reply(cm, text, status):
         if _rate_limited(e):
             # Instagram refused the POST outright (403 throttle), so nothing landed: queue it, the loop retries it
             _queue_retry(cm["id"], text, status)
-            state.update(cm["id"], status="flagged", reason="queued: Instagram is throttling this thread, the bot "
-                                                             "will post it automatically when it clears")
+            state.update(cm["id"], status="flagged", reason="queued: Instagram has paused replies for the account for a "
+                                                             "while, the bot will post it automatically when it clears")
             log(f"queued (throttled) -> @{cm['username']}: {msg[:60]}")
             return None
         if str(e).startswith("HTTP 4"):   # definitive refusal, nothing posted
@@ -350,6 +355,10 @@ def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
             state.update(cm["id"], status="flagged", needs_marcus=1, reason=hold)
             return
         flag_to_marcus(row, thread, label, caption, pre=d, note=f"({hold})")
+        return
+    if ig.comments_blocked():   # can't post now: queue the drafted reply through the critic later, card for now
+        flag_to_marcus(row, thread, label, caption, pre=d)
+        state.update(cm["id"], needs_marcus=0, reason="Instagram limit, drafted while paused")
         return
     v = draft.critique(cm, thread, d["reply"], caption, label, state.replies_on_media(m["id"]))
     if v["verdict"] == "flag":
@@ -947,9 +956,12 @@ def main():
                 if not _paused():
                     state.set_kv("poll_no", int(state.get_kv("poll_no", "0")) + 1)
                     poll_once()
-                    reconcile_open_cards()
-                    retry_queued()
-                    catchup_unanswered()
+                    if not ig.comments_blocked():
+                        reconcile_open_cards()
+                        retry_queued()
+                        catchup_unanswered()
+                    else:
+                        log(f"comment calls paused by Instagram's limit, resuming in {int(ig._BLOCK['until'] - time.time())//60} min")
             # 3) whole-account sweep every SWEEP_MINUTES
             if time.time() >= next_sweep:
                 next_sweep = time.time() + config.SWEEP_MINUTES * 60
