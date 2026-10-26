@@ -134,7 +134,9 @@ def post_reply(cm, text, status):
     verdict = already_answered(cm)
     if verdict is None:
         # transient: keep the card live so Marcus can simply tap again
-        state.update(cm["id"], status="flagged", reason="could not verify the thread (Instagram glitch), tap Approve again")
+        why = ("Instagram's hourly request limit is hit, try again in 10-15 min" if _rate_limited(_LAST_GUARD_ERR[0])
+               else "could not verify the thread (Instagram glitch), tap Approve again")
+        state.update(cm["id"], status="flagged", reason=why)
         return None
     if verdict:
         state.update(cm["id"], status="answered_manually", reason="Marcus replied in the app first")
@@ -352,6 +354,13 @@ def _catchup_one(row):
     cm = {"id": row["id"], "text": row["text"], "timestamp": row["timestamp"],
           "from": {"username": row["username"]}, "parent_id": row.get("parent_id")}
     top_id = row.get("parent_id") or row["id"]
+    # cheap pre-pass on what the db already knows: closers and tags are filed without an API call
+    pre_tier, pre_reason, _ = classify.classify(cm, state.thread_rows(top_id) + [cm])
+    if pre_tier in ("skip", "signoff") and not _LEAD.match(cm.get("text") or ""):
+        state.update(row["id"], status="skipped" if pre_tier == "skip" else "signoff", tier=pre_tier, reason=pre_reason)
+        if row.get("tg_msg_id"):
+            tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"⏭ {pre_reason}: @{row['username']}")
+        return 0
     if True:
         try:
             thread = thread_of(top_id)
@@ -511,7 +520,8 @@ def poll_once():
                 # first sight of a reel: record everything already there and do NOT act on it
                 _bootstrap(m, label, ig.comments(m["id"], max_pages=None))
                 continue
-            fetched = ig.comments(m["id"], max_pages=2)
+            fetched = ig.comments(m["id"], max_pages=2,
+                                  stop=lambda items: bool(items) and any(state.seen(c["id"]) for c in items))   # page 2 only on a burst
         except ig.IGError as e:
             log(f"poll: skipping {label} this round: {e}")
             continue

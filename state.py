@@ -237,3 +237,10 @@ def is_bot_reply(reply_id):
     with _conn() as c:
         return c.execute("SELECT 1 FROM comments WHERE reply_id=? LIMIT 1", (reply_id,)).fetchone() is not None
 
+
+def thread_rows(top_id):
+    """What the db holds of a thread (top comment + replies), as API-shaped dicts, oldest first."""
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM comments WHERE id=? OR parent_id=? ORDER BY ts", (top_id, top_id)).fetchall()
+        return [_d(r) for r in rows]
+
