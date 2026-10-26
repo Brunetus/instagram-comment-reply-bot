@@ -87,15 +87,58 @@ def _author(c):
     return u
 
 
-def thread_of(top_id):
-    """Top comment + all replies, each with a resolved author (or '?'), sorted by time."""
-    top = ig.comment(top_id)
-    items = [top]
-    for r in ig.replies(top_id):
-        r["parent_id"] = top_id
-        r["from"] = {"username": _author(r) or "?"}
-        items.append(r)
-    return sorted(items, key=lambda c: c["timestamp"])
+_THREAD_CACHE = {}     # top_id -> (fetched_at, items): read paths reuse a thread for 5 min
+_NODE_COOLDOWN = {}    # top_id -> until: Instagram rate-limits a single hot comment node; leave it alone a while
+
+
+def _node_limited(e):
+    return "rate-limits on the node" in str(e) or "1349210" in str(e)
+
+
+def thread_of(top_id, fresh=False):
+    """Top comment + all replies, each with a resolved author (or '?'), sorted by time.
+    fresh=False may reuse a fetch from the last 5 minutes (drafting, reconcile, catch-up); the post guard asks fresh."""
+    now = time.time()
+    hit = _THREAD_CACHE.get(top_id)
+    if not fresh and hit and now - hit[0] < 300:
+        return [dict(c) for c in hit[1]]
+    if _NODE_COOLDOWN.get(top_id, 0) > now:
+        raise ig.IGError(f"node {top_id} cooling down after Instagram rate-limits on the node")
+    try:
+        top = ig.comment(top_id)
+        items = [top]
+        for r in ig.replies(top_id):
+            r["parent_id"] = top_id
+            r["from"] = {"username": _author(r) or "?"}
+            items.append(r)
+    except ig.IGError as e:
+        if _node_limited(e):
+            _NODE_COOLDOWN[top_id] = now + 1800
+        raise
+    items = sorted(items, key=lambda c: c["timestamp"])
+    _THREAD_CACHE[top_id] = (now, items)
+    return [dict(c) for c in items]
+
+
+def _answered_via_media(cm):
+    """Fallback when the comment node itself is rate-limited: read the newest comments of the REEL (a different node)
+    plus what the poll has stored. True/False, or None if that fails too."""
+    top_id = cm.get("parent_id") or cm["id"]
+    media_id = cm.get("media_id")
+    if not media_id:
+        return None
+    try:
+        recent = ig.comments(media_id, max_pages=3)
+    except ig.IGError as e:
+        log("guard fallback failed:", str(e)[:120])
+        return None
+    for c in recent + state.thread_rows(top_id):
+        if c["id"] == cm["id"] or (c.get("parent_id") or c["id"]) != top_id:
+            continue
+        a = (c.get("from") or {}).get("username")
+        if a in (ME, "?", None) and (not cm.get("parent_id") or (c.get("timestamp") or "") > cm["timestamp"]):
+            return True
+    return False
 
 
 def already_answered(cm):
@@ -105,9 +148,13 @@ def already_answered(cm):
     Re-fetched live every time, never from cache."""
     top_id = cm.get("parent_id") or cm["id"]
     try:
-        thread = thread_of(top_id)
+        thread = thread_of(top_id, fresh=True)
     except ig.IGError as e:
         _LAST_GUARD_ERR[0] = str(e)
+        if _node_limited(e):   # only this comment is throttled: verify through the reel instead
+            v = _answered_via_media(cm)
+            log(f"guard: node limited, checked via the reel instead -> {v}")
+            return v
         log("guard: could not fetch thread:", str(e)[:160])
         return None
     for c in thread:
@@ -134,7 +181,7 @@ def post_reply(cm, text, status):
     verdict = already_answered(cm)
     if verdict is None:
         # transient: keep the card live so Marcus can simply tap again
-        why = ("Instagram's hourly request limit is hit, try again in 10-15 min" if _rate_limited(_LAST_GUARD_ERR[0])
+        why = ("Instagram is throttling reads right now, try again in 10-15 min" if _rate_limited(_LAST_GUARD_ERR[0])
                else "could not verify the thread (Instagram glitch), tap Approve again")
         state.update(cm["id"], status="flagged", reason=why)
         return None

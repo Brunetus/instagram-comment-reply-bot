@@ -30,7 +30,7 @@ def _call(path, params, data=None):
         except urllib.error.HTTPError as e:
             msg = e.read().decode(errors="replace")[:300]
             last = IGError(f"HTTP {e.code} on {path}: {msg}")
-            if e.code in (400, 403, 404):   # not transient, don't hammer
+            if e.code in (400, 403, 404):   # not transient (or a rate limit): retrying only deepens it
                 raise last
         except Exception as e:  # timeouts, connection resets
             last = IGError(f"{type(e).__name__} on {path}: {e}")
