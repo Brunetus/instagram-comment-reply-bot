@@ -252,3 +252,8 @@ def requeue(reason_like):
                         (time.time(), reason_like))
         return cur.rowcount
 
+
+def kv_prefix(prefix):
+    with _conn() as c:
+        return [(r["k"], r["v"]) for r in c.execute("SELECT k, v FROM kv WHERE k LIKE ?", (prefix + "%",)).fetchall()]
+

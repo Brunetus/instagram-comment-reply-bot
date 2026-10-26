@@ -193,11 +193,72 @@ def post_reply(cm, text, status):
     msg = text
     if cm.get("parent_id") and not text.lower().startswith(f"@{cm['username']}".lower()):
         msg = f"@{cm['username']} {text}"
-    rid = ig.reply(top_id, msg)
+    try:
+        rid = ig.reply(top_id, msg)
+    except ig.IGError as e:
+        if _rate_limited(e):
+            # Instagram refused the POST outright (403 throttle), so nothing landed: queue it, the loop retries it
+            _queue_retry(cm["id"], text, status)
+            state.update(cm["id"], status="flagged", reason="queued: Instagram is throttling this thread, the bot "
+                                                             "will post it automatically when it clears")
+            log(f"queued (throttled) -> @{cm['username']}: {msg[:60]}")
+            return None
+        if str(e).startswith("HTTP 4"):   # definitive refusal, nothing posted
+            state.update(cm["id"], status="flagged", reason=f"Instagram refused the reply: {str(e)[:120]}")
+            return None
+        state.update(cm["id"], status="error", reason=f"post outcome unknown, not retried: {str(e)[:120]}")
+        raise   # a timeout may have landed: never retry, surface it
     state.update(cm["id"], status=status, reply_text=msg, reply_id=rid)
+    state.set_kv(f"retry:{cm['id']}", "")
     log(f"posted [{status}] -> @{cm['username']}: {msg[:80]}")
     time.sleep(config.POST_GAP_SECONDS)
     return rid
+
+
+def _queue_retry(cid, text, status):
+    raw = state.get_kv(f"retry:{cid}")
+    try:
+        prev = json.loads(raw) if raw else {}
+    except ValueError:
+        prev = {}
+    tries = int(prev.get("tries", 0)) + 1
+    state.set_kv(f"retry:{cid}", json.dumps({"text": text, "status": status, "tries": tries,
+                                             "at": time.time() + min(20 * 60 * tries, 2 * 3600)}))
+
+
+def retry_queued(limit=5):
+    """Replies Instagram throttled: post them when their time comes (same guard as any post). Gives up after 8 tries."""
+    n = 0
+    for k, raw in state.kv_prefix("retry:"):
+        if n >= limit or not raw:
+            continue
+        try:
+            job = json.loads(raw)
+        except ValueError:
+            state.set_kv(k, ""); continue
+        if job.get("at", 0) > time.time():
+            continue
+        cid = k.split(":", 1)[1]
+        row = state.get(cid)
+        if not row or row["status"] != "flagged":
+            state.set_kv(k, ""); continue
+        if int(job.get("tries", 0)) >= 8:
+            state.set_kv(k, "")
+            if row.get("tg_msg_id"):
+                tg.send(f"⚠️ gave up on @{row['username']} after 8 tries, Instagram kept throttling. Tap Approve again later.",
+                        reply_to=row["tg_msg_id"])
+            continue
+        n += 1
+        try:
+            rid = post_reply(row, job["text"], job["status"])
+        except Exception as e:
+            log("retry failed", repr(e)[:120]); state.set_kv(k, ""); continue
+        if rid and row.get("tg_msg_id"):
+            icon = "✏️ posted your text" if job["status"] == "edited_posted" else "✅ posted"
+            if job["status"] == "auto_drafted":
+                icon = "🤖 posted"
+            tg.edit(row["tg_msg_id"], f"{icon} to @{row['username']}: {job['text']} (after Instagram's throttle cleared)")
+    return n
 
 
 # ---------- telegram cards ----------
@@ -757,7 +818,8 @@ def handle_update(u):
             if rid:
                 tg.edit(row["tg_msg_id"], f"✅ posted to @{row['username']}: {row['draft']}")
             elif after["status"] == "flagged":   # transient glitch or blocked text: keep the buttons
-                wid = tg.send(f"⚠️ not posted to @{row['username']}: {after['reason']}", reply_to=row["tg_msg_id"])
+                icon = "⏳" if (after.get("reason") or "").startswith("queued") else "⚠️ not posted to"
+                wid = tg.send(f"{icon} @{row['username']}: {after['reason']}", reply_to=row["tg_msg_id"])
                 state.set_kv(f"prompt:{wid}", cid)   # replying to the warning still targets this card
             else:
                 tg.edit(row["tg_msg_id"], f"↩️ did not post to @{row['username']}: {after['reason']}")
@@ -810,7 +872,8 @@ def handle_update(u):
     if rid:
         tg.edit(row["tg_msg_id"], f"✏️ posted your text to @{row['username']}: {clean}")
     elif after["status"] == "flagged":   # blocked wording or a glitch: card stays live, try again
-        wid = tg.send(f"⚠️ not posted: {after['reason']}", reply_to=row["tg_msg_id"])
+        icon = "⏳" if (after.get("reason") or "").startswith("queued") else "⚠️ not posted:"
+        wid = tg.send(f"{icon} {after['reason']}", reply_to=row["tg_msg_id"])
         state.set_kv(f"prompt:{wid}", row["id"])
     else:
         tg.edit(row["tg_msg_id"], f"↩️ did not post to @{row['username']}: {after['reason']}")
@@ -885,6 +948,7 @@ def main():
                     state.set_kv("poll_no", int(state.get_kv("poll_no", "0")) + 1)
                     poll_once()
                     reconcile_open_cards()
+                    retry_queued()
                     catchup_unanswered()
             # 3) whole-account sweep every SWEEP_MINUTES
             if time.time() >= next_sweep:
