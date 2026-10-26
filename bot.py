@@ -232,8 +232,11 @@ def _card(cm, thread, label, d):
 
 _BUTTONS = [("✅ Approve", "ap"), ("✏️ Edit", "ed"), ("⏭ Skip", "sk")]
 _LEAD = re.compile(r"^\W*(money)\W*$", re.I)   # comment keywords that mean "send me the thing": always Marcus's
-_CRUDE = re.compile(r"\b(fuck\w*|shit\w*|sexy|daddy|kys|fraud|scam\w*|garbage|who asked|bitch\w*|retard\w*|rape|nazi|jew\w*|"
-                    r"gay|tranny|slut|whore|porn\w*|onlyfans|nude\w*)\b", re.I)   # a human decides these, never the critic alone
+# slurs, sexual content, self-harm: a human decides these, never the critic alone. Mild swearing ("shit", "damn"),
+# "sexy" (the reels' own premise) and plain negation ("not", "no", "nah") go to the critic, which judges tone
+# (2026-10-26: the old word list held 19 of 31 friendly comments for words like "not alone" and "bro cooked").
+_CRUDE = re.compile(r"\b(kys|kill yourself|bitch\w*|retard\w*|rape\w*|nazi\w*|jew\w*|gay|fag\w*|tranny|slut\w*|whore\w*|"
+                    r"porn\w*|onlyfans|nudes?|dick|pussy|cum|n[i1]gg\w*)\b", re.I)
 _LAST_AUTO = [0.0]
 _LAST_GUARD_ERR = [""]
 
@@ -275,8 +278,8 @@ def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
         hold = "lead keyword"
     elif row.get("reason") == "emoji outside the allow-list":
         hold = "emoji outside the allow-list"
-    elif classify._NEG.search(stripped) or _CRUDE.search(stripped):
-        hold = "negative, hostile or crude wording"
+    elif _CRUDE.search(stripped):
+        hold = "slur or sexual wording"
     elif by_hand or state.thread_answered_by_hand(top_id):
         hold = "you are handling this thread yourself"
     elif "@" in d["reply"]:
@@ -849,6 +852,10 @@ def main():
     except Exception as e:
         log("startup disarm failed", repr(e))
     log(f"bot up · auto_post={config.AUTO_POST} · auto_draft={config.AUTO_DRAFT} · model={config.DRAFT_MODEL} · tz={config.TZ}")
+    if state.get_kv("requeued_neg_holds") != "2026-10-26":
+        state.set_kv("requeued_neg_holds", "2026-10-26")
+        n = state.requeue(reason_like="%negative, hostile or crude wording%")
+        log(f"re-queued {n} cards held by the old negative-word list")
     if config.AUTO_POST and state.get_kv("settled_short_cards") != "2026-10-08":
         state.set_kv("settled_short_cards", "2026-10-08")   # once, even if the pass itself errors out
         try:

@@ -244,3 +244,11 @@ def thread_rows(top_id):
         rows = c.execute("SELECT * FROM comments WHERE id=? OR parent_id=? ORDER BY ts", (top_id, top_id)).fetchall()
         return [_d(r) for r in rows]
 
+
+def requeue(reason_like):
+    """Open cards held for a reason that no longer applies: clear the hold so the catch-up takes them."""
+    with _conn() as c:
+        cur = c.execute("UPDATE comments SET needs_marcus=0, updated_at=? WHERE status='flagged' AND reason LIKE ?",
+                        (time.time(), reason_like))
+        return cur.rowcount
+
