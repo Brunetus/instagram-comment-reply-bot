@@ -16,6 +16,7 @@ Invariants (also the audit brief):
 import datetime as dt
 import json
 import re
+import threading
 import time
 import traceback
 import zoneinfo
@@ -171,7 +172,18 @@ def already_answered(cm):
 
 # ---------- posting ----------
 def post_reply(cm, text, status):
-    """Posts `text` for comment `cm` (API dict or state dict). Returns the reply id, or None if it stood down."""
+    """Posts `text` for comment `cm` (API dict or state dict). Returns the reply id, or None if it stood down.
+    Serialised across threads: a tap and the catch-up may hold the same comment, so the row is re-read under the lock
+    and anything no longer open (posted, declined, answered in the app, deleted) is left alone."""
+    with _POST_LOCK:
+        cur = state.get(dict(cm)["id"])
+        if cur and cur["status"] not in ("new", "preexisting", "flagged"):
+            log(f"stand down (already {cur['status']}): @{cur['username']} {cur['id']}")
+            return None
+        return _post_reply(cm, text, status)
+
+
+def _post_reply(cm, text, status):
     cm = dict(cm)
     bad = content_violation(text)
     if bad:
@@ -305,6 +317,8 @@ _CRUDE = re.compile(r"\b(kys|kill yourself|bitch\w*|retard\w*|rape\w*|nazi\w*|je
                     r"porn\w*|onlyfans|nudes?|dick|pussy|cum|n[i1]gg\w*)\b", re.I)
 _LAST_AUTO = [0.0]
 _LAST_GUARD_ERR = [""]
+_POST_LOCK = threading.RLock()   # the Telegram thread (taps, typed replies) and the Instagram worker never post at once
+_SWEEP_NOW = threading.Event()   # /sweep asks the worker for a full-account pass right away
 
 
 def _posted_card(cm, thread, label, d, posted, why, edit_msg_id=None):
@@ -858,7 +872,7 @@ def handle_update(u):
             if _paused():
                 tg.send("paused, /resume first")
             else:
-                tg.send("sweeping every reel, give me a few minutes…"); n = sweep(); tg.send(f"sweep done, {n} new comments handled")
+                _SWEEP_NOW.set(); tg.send("sweeping every reel in the background, I'll report when it's done")
         else:
             tg.send(HELP)
         return
@@ -935,13 +949,16 @@ def main():
         except Exception as e:
             log("settle failed", repr(e)); traceback.print_exc()
     tg.send(f"🤖 bot online · auto-post {'ON' if config.AUTO_POST else 'shadow'} · polling every {config.POLL_SECONDS//60} min\n{HELP}")
+    worker = threading.Thread(target=_ig_worker, name="instagram", daemon=True)
+    worker.start()
     offset = int(state.get_kv("tg_offset", "0"))
-    next_poll = 0.0
-    next_sweep = time.time() + 120   # first full-account sweep 2 min after start (bootstraps every reel, acts on none)
     errors = 0
-    while True:
+    while True:   # Telegram only: taps and typed replies are answered within a second, whatever Instagram is doing
         try:
-            # 1) Telegram (blocks up to 25s, which is also our sleep)
+            if not worker.is_alive():   # the worker catches everything itself; this is the belt to its braces
+                log("instagram worker died, restarting it")
+                worker = threading.Thread(target=_ig_worker, name="instagram", daemon=True)
+                worker.start()
             for u in tg.get_updates(offset):
                 offset = u["update_id"] + 1
                 state.set_kv("tg_offset", offset)
@@ -950,7 +967,24 @@ def main():
                 except Exception as e:
                     log("telegram handler error", repr(e)); traceback.print_exc()
                     tg.send(f"⚠️ error handling that: {type(e).__name__}: {str(e)[:150]}")
-            # 2) Instagram poll
+            errors = 0
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            errors += 1
+            log("telegram loop error", repr(e)); traceback.print_exc()
+            time.sleep(min(60 * errors, 600))
+
+
+def _ig_worker():
+    """The Instagram side on its own thread: poll, retry queue, catch-up, sweep, digest. Nothing here ever makes a
+    Telegram tap wait; posting itself is serialised with the taps through _POST_LOCK in post_reply."""
+    next_poll = 0.0
+    next_sweep = time.time() + 120   # first full-account sweep 2 min after start (bootstraps every reel, acts on none)
+    errors = 0
+    while True:
+        try:
+            # 1) Instagram poll
             if time.time() >= next_poll:
                 next_poll = time.time() + config.POLL_SECONDS
                 if not _paused():
@@ -962,19 +996,22 @@ def main():
                         catchup_unanswered()
                     else:
                         log(f"comment calls paused by Instagram's limit, resuming in {int(ig._BLOCK['until'] - time.time())//60} min")
-            # 3) whole-account sweep every SWEEP_MINUTES
-            if time.time() >= next_sweep:
+            # 2) whole-account sweep every SWEEP_MINUTES, or now on /sweep
+            if _SWEEP_NOW.is_set() or time.time() >= next_sweep:
+                asked = _SWEEP_NOW.is_set()
+                _SWEEP_NOW.clear()
                 next_sweep = time.time() + config.SWEEP_MINUTES * 60
                 if not _paused():
-                    sweep()
-            # 4) daily digest
+                    n = sweep()
+                    if asked:
+                        tg.send(f"sweep done, {n} new comments handled")
+            # 3) daily digest
             now = dt.datetime.now(_LOCAL)
             today = now.strftime("%Y-%m-%d")
             if config.DIGEST_HOUR >= 0 and now.hour >= config.DIGEST_HOUR and state.get_kv("last_digest") != today:
                 state.set_kv("last_digest", today); digest()
             errors = 0
-        except KeyboardInterrupt:
-            raise
+            _SWEEP_NOW.wait(5)   # idle in 5 s steps; a /sweep wakes it at once
         except Exception as e:
             errors += 1
             log("loop error", repr(e)); traceback.print_exc()
