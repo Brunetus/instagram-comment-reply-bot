@@ -177,8 +177,12 @@ def post_reply(cm, text, status):
     and anything no longer open (posted, declined, answered in the app, deleted) is left alone."""
     with _POST_LOCK:
         cur = state.get(dict(cm)["id"])
-        if cur and cur["status"] not in ("new", "preexisting", "flagged"):
+        if cur and cur["status"] not in state.OPEN:
             log(f"stand down (already {cur['status']}): @{cur['username']} {cur['id']}")
+            return None
+        pe = _pending_edit() if status.startswith("auto") else None
+        if pe and pe.get("cid") == dict(cm)["id"]:   # Marcus tapped Edit on this one: his text is coming
+            log(f"stand down (Edit armed): @{dict(cm)['username']}")
             return None
         rid = _post_reply(cm, text, status)
     if rid:
@@ -476,6 +480,7 @@ def catchup_unanswered():
     for row in state.backlog(config.CATCHUP_SINCE, config.CATCHUP_PER_POLL):
         if time.time() - t0 > config.CATCHUP_SECONDS:
             break
+        state.set_kv("worker_beat", time.time())
         pe = _pending_edit()
         if pe and pe.get("cid") == row["id"]:   # Marcus is typing a reply for this one right now
             continue
@@ -503,8 +508,7 @@ def _catchup_one(row):
     # cheap pre-pass on what the db already knows: closers and tags are filed without an API call
     pre_tier, pre_reason, _ = classify.classify(cm, state.thread_rows(top_id) + [cm])
     if pre_tier in ("skip", "signoff") and not _LEAD.match(cm.get("text") or ""):
-        state.update_if(row["id"], state.OPEN, status="skipped" if pre_tier == "skip" else "signoff", tier=pre_tier, reason=pre_reason)
-        if row.get("tg_msg_id"):
+        if state.update_if(row["id"], state.OPEN, status="skipped" if pre_tier == "skip" else "signoff", tier=pre_tier, reason=pre_reason) and row.get("tg_msg_id"):
             tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"⏭ {pre_reason}: @{row['username']}")
         return 0
     if True:
@@ -512,8 +516,7 @@ def _catchup_one(row):
             thread = thread_of(top_id)
         except ig.IGError as e:
             if "does not exist" in str(e):
-                state.update_if(row["id"], state.OPEN, status="deleted", reason="comment gone")
-                if row.get("tg_msg_id"):
+                if state.update_if(row["id"], state.OPEN, status="deleted", reason="comment gone") and row.get("tg_msg_id"):
                     tg.delete(row["tg_msg_id"])
             else:
                 log(f"catchup: skipping @{row['username']}: {str(e)[:120]}")
@@ -521,8 +524,7 @@ def _catchup_one(row):
                     raise RateLimited()
             return 0
         if any((c.get("from") or {}).get("username") == ME and c["timestamp"] > row["timestamp"] for c in thread):
-            state.update_if(row["id"], state.OPEN, status="answered_manually", reason="already answered")
-            if row.get("tg_msg_id"):
+            if state.update_if(row["id"], state.OPEN, status="answered_manually", reason="already answered") and row.get("tg_msg_id"):
                 tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"✋ already answered @{row['username']}")
             return 0
         if not any(c["id"] == cm["id"] for c in thread):
@@ -537,8 +539,7 @@ def _catchup_one(row):
             return 0
         tier, reason, auto_text = classify.classify(cm, thread)
         if tier in ("skip", "signoff"):
-            state.update_if(row["id"], state.OPEN, status="skipped" if tier == "skip" else "signoff", tier=tier, reason=reason)
-            if row.get("tg_msg_id"):
+            if state.update_if(row["id"], state.OPEN, status="skipped" if tier == "skip" else "signoff", tier=tier, reason=reason) and row.get("tg_msg_id"):
                 tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"⏭ {reason}: @{row['username']}")
             return 0
         state.update_if(row["id"], state.OPEN, tier=tier, reason=reason)   # status stays as it is: a card stays tappable
@@ -595,14 +596,14 @@ def reconcile_open_cards():
             except ig.IGError as e:
                 if "does not exist" not in str(e):
                     continue
-            state.update_if(row["id"], state.OPEN, status="deleted", reason="comment deleted by its author")
-            if row.get("tg_msg_id"):
+            if state.update_if(row["id"], state.OPEN, status="deleted", reason="comment deleted by its author") and row.get("tg_msg_id"):
                 tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"🗑 @{row['username']} deleted their comment")
             log(f"reconcile: @{row['username']} deleted their comment, card removed")
             continue
         if verdict is not True:
             continue
-        state.update_if(row["id"], state.OPEN, status="answered_manually", reason="Marcus replied in the app")
+        if not state.update_if(row["id"], state.OPEN, status="answered_manually", reason="Marcus replied in the app"):
+            continue   # settled by a tap meanwhile: its card already shows the outcome
         n += 1
         if not row.get("tg_msg_id"):
             continue
@@ -696,6 +697,7 @@ def sweep():
         if m["id"] in tracked:
             continue   # the hot 7 are polled every POLL_SECONDS already
         label = (m.get("caption") or m["shortcode"]).split("\n")[0][:40]
+        state.set_kv("worker_beat", time.time())
         try:
             state.upsert_media(m, label)
             stop = lambda items: bool(items) and all(c["timestamp"] < since or state.seen(c["id"]) for c in items)
@@ -875,7 +877,10 @@ def _handle_tap(code, cid, row, cb):
             tg.edit(row["tg_msg_id"], f"⏭ skipped @{row['username']}: {(row['text'] or '')[:80]}")
         else:
             after = state.get(cid)
-            tg.edit(row["tg_msg_id"], f"🤖 posted to @{row['username']}: {after.get('reply_text') or after['status']}")
+            if after["status"] in POSTED:
+                tg.edit(row["tg_msg_id"], f"🤖 posted to @{row['username']}: {after['reply_text']}")
+            else:
+                tg.edit(row["tg_msg_id"], f"⏭ @{row['username']} was already settled ({after['status'].replace('_', ' ')})")
 
 
 def _handle_text(u):
@@ -1019,6 +1024,7 @@ def _ig_worker():
     next_poll = 0.0
     next_sweep = time.time() + 120   # first full-account sweep 2 min after start (bootstraps every reel, acts on none)
     errors = 0
+    state.set_kv("worker_beat", time.time())
     while True:
         try:
             # 1) Instagram poll
