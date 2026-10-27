@@ -94,6 +94,21 @@ def update(comment_id, **fields):
         c.execute(f"UPDATE comments SET {cols} WHERE id=?", (*fields.values(), comment_id))
 
 
+OPEN = ("new", "preexisting", "flagged")   # a row the bot may still act on; anything else is settled
+
+
+def update_if(comment_id, statuses, **fields):
+    """update() that only applies while the row is still in one of `statuses`. Two threads (Marcus's taps,
+    the Instagram worker) may hold the same row: whoever settles it first wins, the other sees False."""
+    fields["updated_at"] = time.time()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    marks = ",".join("?" * len(statuses))
+    with _conn() as c:
+        cur = c.execute(f"UPDATE comments SET {cols} WHERE id=? AND status IN ({marks})",
+                        (*fields.values(), comment_id, *statuses))
+        return cur.rowcount > 0
+
+
 def _d(row):
     """sqlite Row -> plain dict shaped like an API comment (adds `timestamp` and `from`), so the same
     helpers work on both. Returns None for None."""

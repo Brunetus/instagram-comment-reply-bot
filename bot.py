@@ -180,7 +180,10 @@ def post_reply(cm, text, status):
         if cur and cur["status"] not in ("new", "preexisting", "flagged"):
             log(f"stand down (already {cur['status']}): @{cur['username']} {cur['id']}")
             return None
-        return _post_reply(cm, text, status)
+        rid = _post_reply(cm, text, status)
+    if rid:
+        time.sleep(config.POST_GAP_SECONDS)   # pacing between posts, outside the lock so a tap never waits on it
+    return rid
 
 
 def _post_reply(cm, text, status):
@@ -228,7 +231,6 @@ def _post_reply(cm, text, status):
     state.update(cm["id"], status=status, reply_text=msg, reply_id=rid)
     state.set_kv(f"retry:{cm['id']}", "")
     log(f"posted [{status}] -> @{cm['username']}: {msg[:80]}")
-    time.sleep(config.POST_GAP_SECONDS)
     return rid
 
 
@@ -317,6 +319,7 @@ _CRUDE = re.compile(r"\b(kys|kill yourself|bitch\w*|retard\w*|rape\w*|nazi\w*|je
                     r"porn\w*|onlyfans|nudes?|dick|pussy|cum|n[i1]gg\w*)\b", re.I)
 _LAST_AUTO = [0.0]
 _LAST_GUARD_ERR = [""]
+POSTED = ("approved_posted", "edited_posted", "auto_posted", "auto_drafted")
 _POST_LOCK = threading.RLock()   # the Telegram thread (taps, typed replies) and the Instagram worker never post at once
 _SWEEP_NOW = threading.Event()   # /sweep asks the worker for a full-account pass right away
 
@@ -346,7 +349,7 @@ def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
         if not edit_msg_id:
             flag_to_marcus(row, thread, label, caption, pre=d)
         else:
-            state.update(cm["id"], status="flagged")
+            state.update_if(cm["id"], state.OPEN, status="flagged")
         return
     stripped = classify._MENTION.sub("", text)
     by_hand = any((c.get("from") or {}).get("username") in (ME, "?", None) and c["id"] != cm["id"]
@@ -364,20 +367,26 @@ def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
         hold = "you are handling this thread yourself"
     elif "@" in d["reply"]:
         hold = "draft tags someone"
+    pe = _pending_edit()
+    if pe and pe.get("cid") == cm["id"]:   # Marcus tapped Edit on this one, his text is coming: leave it to him
+        return
     if hold:
         if edit_msg_id:   # an old card: keep it, it already has buttons
-            state.update(cm["id"], status="flagged", needs_marcus=1, reason=hold)
+            state.update_if(cm["id"], state.OPEN, status="flagged", needs_marcus=1, reason=hold)
             return
         flag_to_marcus(row, thread, label, caption, pre=d, note=f"({hold})")
         return
     if ig.comments_blocked():   # can't post now: queue the drafted reply through the critic later, card for now
+        if edit_msg_id:   # the card is already there: never send a second one
+            state.update_if(cm["id"], state.OPEN, needs_marcus=0, reason="Instagram limit, drafted while paused")
+            return
         flag_to_marcus(row, thread, label, caption, pre=d)
-        state.update(cm["id"], needs_marcus=0, reason="Instagram limit, drafted while paused")
+        state.update_if(cm["id"], state.OPEN, needs_marcus=0, reason="Instagram limit, drafted while paused")
         return
     v = draft.critique(cm, thread, d["reply"], caption, label, state.replies_on_media(m["id"]))
     if v["verdict"] == "flag":
         if edit_msg_id:
-            state.update(cm["id"], status="flagged", needs_marcus=1, reason=f"critic: {v['reason']}")
+            state.update_if(cm["id"], state.OPEN, status="flagged", needs_marcus=1, reason=f"critic: {v['reason']}")
             return
         flag_to_marcus(row, thread, label, caption, pre=d, note=f"(critic: {v['reason']})")
         return
@@ -402,8 +411,12 @@ def flag_to_marcus(cm, thread, label, caption, note=None, pre=None):
     if note:
         label = f"{label} {note}"
     msg_id = tg.send(_card(cm, thread, label, d), buttons=[[(l, f"{code}:{cm['id']}") for l, code in _BUTTONS]])
-    state.update(cm["id"], status="flagged", draft=d["reply"], needs_marcus=int(bool(d["needs_marcus"] or note)),
-                 tg_msg_id=msg_id, reason=(note or d.get("note")))   # a note = a hold: the catch-up must not redraft it
+    if not state.update_if(cm["id"], state.OPEN, status="flagged", draft=d["reply"], tg_msg_id=msg_id,
+                           needs_marcus=int(bool(d["needs_marcus"] or note)),   # a note = a hold: the catch-up must not redraft it
+                           reason=(note or d.get("note"))):
+        tg.delete(msg_id)   # settled meanwhile (Marcus's tap won): no card
+        log(f"card dropped, @{cm['username']} was settled while drafting")
+        return
     log(f"flagged -> card {msg_id}: @{cm['username']} \"{(cm.get('text') or '')[:50]}\" draft: {d['reply'][:60]}")
 
 
@@ -460,10 +473,10 @@ def catchup_unanswered():
     time: open cards and comments recorded at first sight since CATCHUP_SINCE. Each one is checked live first."""
     n = 0
     t0 = time.time()
-    pe = _pending_edit()
     for row in state.backlog(config.CATCHUP_SINCE, config.CATCHUP_PER_POLL):
         if time.time() - t0 > config.CATCHUP_SECONDS:
             break
+        pe = _pending_edit()
         if pe and pe.get("cid") == row["id"]:   # Marcus is typing a reply for this one right now
             continue
         try:
@@ -472,8 +485,7 @@ def catchup_unanswered():
             log("catchup: Instagram rate limit hit, resuming next poll"); break
         except Exception as e:
             log(f"catchup: error on @{row['username']} {row['id']}: {e!r}")
-            if (state.get(row["id"]) or {}).get("status") in ("new", "preexisting", "flagged"):
-                state.update(row["id"], status="error", reason=f"catchup: {str(e)[:150]}")
+            state.update_if(row["id"], state.OPEN, status="error", reason=f"catchup: {str(e)[:150]}")
     if n:
         log(f"catchup: worked through {n} unanswered comments")
     return n
@@ -491,7 +503,7 @@ def _catchup_one(row):
     # cheap pre-pass on what the db already knows: closers and tags are filed without an API call
     pre_tier, pre_reason, _ = classify.classify(cm, state.thread_rows(top_id) + [cm])
     if pre_tier in ("skip", "signoff") and not _LEAD.match(cm.get("text") or ""):
-        state.update(row["id"], status="skipped" if pre_tier == "skip" else "signoff", tier=pre_tier, reason=pre_reason)
+        state.update_if(row["id"], state.OPEN, status="skipped" if pre_tier == "skip" else "signoff", tier=pre_tier, reason=pre_reason)
         if row.get("tg_msg_id"):
             tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"⏭ {pre_reason}: @{row['username']}")
         return 0
@@ -500,7 +512,7 @@ def _catchup_one(row):
             thread = thread_of(top_id)
         except ig.IGError as e:
             if "does not exist" in str(e):
-                state.update(row["id"], status="deleted", reason="comment gone")
+                state.update_if(row["id"], state.OPEN, status="deleted", reason="comment gone")
                 if row.get("tg_msg_id"):
                     tg.delete(row["tg_msg_id"])
             else:
@@ -509,7 +521,7 @@ def _catchup_one(row):
                     raise RateLimited()
             return 0
         if any((c.get("from") or {}).get("username") == ME and c["timestamp"] > row["timestamp"] for c in thread):
-            state.update(row["id"], status="answered_manually", reason="already answered")
+            state.update_if(row["id"], state.OPEN, status="answered_manually", reason="already answered")
             if row.get("tg_msg_id"):
                 tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"✋ already answered @{row['username']}")
             return 0
@@ -521,15 +533,15 @@ def _catchup_one(row):
         if _LEAD.match(cm.get("text") or ""):
             if not row.get("tg_msg_id"):
                 flag_to_marcus(state.get(row["id"]), thread, label, m["caption"], note="(🎯 lead keyword, DM them the guide by hand)")
-            state.update(row["id"], status="flagged", tier="flag", needs_marcus=1, reason="lead keyword")
+            state.update_if(row["id"], state.OPEN, status="flagged", tier="flag", needs_marcus=1, reason="lead keyword")
             return 0
         tier, reason, auto_text = classify.classify(cm, thread)
         if tier in ("skip", "signoff"):
-            state.update(row["id"], status="skipped" if tier == "skip" else "signoff", tier=tier, reason=reason)
+            state.update_if(row["id"], state.OPEN, status="skipped" if tier == "skip" else "signoff", tier=tier, reason=reason)
             if row.get("tg_msg_id"):
                 tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"⏭ {reason}: @{row['username']}")
             return 0
-        state.update(row["id"], tier=tier, status="new", reason=reason)
+        state.update_if(row["id"], state.OPEN, tier=tier, reason=reason)   # status stays as it is: a card stays tappable
         fresh = state.get(row["id"])
         if tier == "auto":
             if auto_text is None:
@@ -537,11 +549,11 @@ def _catchup_one(row):
                 if d["needs_marcus"] or len(re.findall(r"[A-Za-z0-9']+", d["reply"])) > 3 or "?" in d["reply"] or "@" in d["reply"]:
                     if not row.get("tg_msg_id"):
                         flag_to_marcus(state.get(row["id"]), thread, label, m["caption"], pre=d)
-                    state.update(row["id"], status="flagged", tier="flag", needs_marcus=1, reason="short draft needs a look")
+                    state.update_if(row["id"], state.OPEN, status="flagged", tier="flag", needs_marcus=1, reason="short draft needs a look")
                     return 0
                 auto_text = d["reply"]
             if not config.AUTO_POST:   # shadow mode: never post the auto tier from the backlog either
-                state.update(row["id"], status="flagged", needs_marcus=1, reason="auto tier in shadow")
+                state.update_if(row["id"], state.OPEN, status="flagged", needs_marcus=1, reason="auto tier in shadow")
                 return 0
             rid = post_reply(fresh, auto_text, "auto_posted")
             if rid and row.get("tg_msg_id"):
@@ -550,8 +562,8 @@ def _catchup_one(row):
                 flag_to_marcus(state.get(row["id"]), thread, label, m["caption"], note="(could not auto-post)")
         else:
             auto_or_flag(fresh, cm, thread, m, label, edit_msg_id=row.get("tg_msg_id"))
-            if state.get(row["id"])["status"] == "new":   # a hold on an old card: leave the card as it was
-                state.update(row["id"], status="flagged")
+            if state.get(row["id"])["status"] == "preexisting":   # nothing posted and no card made: a card next time
+                state.update_if(row["id"], ("preexisting",), status="flagged")
         return 1
 
 
@@ -583,14 +595,14 @@ def reconcile_open_cards():
             except ig.IGError as e:
                 if "does not exist" not in str(e):
                     continue
-            state.update(row["id"], status="deleted", reason="comment deleted by its author")
+            state.update_if(row["id"], state.OPEN, status="deleted", reason="comment deleted by its author")
             if row.get("tg_msg_id"):
                 tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], f"🗑 @{row['username']} deleted their comment")
             log(f"reconcile: @{row['username']} deleted their comment, card removed")
             continue
         if verdict is not True:
             continue
-        state.update(row["id"], status="answered_manually", reason="Marcus replied in the app")
+        state.update_if(row["id"], state.OPEN, status="answered_manually", reason="Marcus replied in the app")
         n += 1
         if not row.get("tg_msg_id"):
             continue
@@ -738,6 +750,9 @@ def _status_text():
                   f"declined {c['declined']} · skipped {c['skipped']+c['signoff']} · you beat me to {c['answered_manually']}"
                   + (f" · errors {c['error']}" if c['error'] else ""),
               f"Waiting on you: {waiting} · Auto-post: {'ON' if config.AUTO_POST else 'shadow'} · Paused: {_paused()}"]
+    beat = float(state.get_kv("worker_beat", "0") or 0)
+    if beat:
+        lines.append(f"Instagram side last ticked {int(time.time() - beat) // 60} min ago")
     return "\n".join(lines)
 
 
@@ -831,25 +846,39 @@ def handle_update(u):
             pass
         if not live:
             return
-        if code == "ed":
-            _arm_edit(row, (cb.get("message") or {}).get("text") or "")
-            return
-        _disarm_edit()   # any other tap ends an armed Edit, on this card or another
-        if code == "ap":
-            rid = post_reply(row, row["draft"], "approved_posted")
-            after = state.get(cid)
-            if rid:
-                tg.edit(row["tg_msg_id"], f"✅ posted to @{row['username']}: {row['draft']}")
-            elif after["status"] == "flagged":   # transient glitch or blocked text: keep the buttons
-                icon = "⏳" if (after.get("reason") or "").startswith("queued") else "⚠️ not posted to"
-                wid = tg.send(f"{icon} @{row['username']}: {after['reason']}", reply_to=row["tg_msg_id"])
-                state.set_kv(f"prompt:{wid}", cid)   # replying to the warning still targets this card
-            else:
-                tg.edit(row["tg_msg_id"], f"↩️ did not post to @{row['username']}: {after['reason']}")
-        elif code == "sk":
-            state.update(cid, status="declined")
-            tg.edit(row["tg_msg_id"], f"⏭ skipped @{row['username']}: {(row['text'] or '')[:80]}")
+        with _POST_LOCK:   # the worker may be posting this very row: one of us settles it, the other sees that
+            _handle_tap(code, cid, row, cb)
         return
+    _handle_text(u)
+
+
+def _handle_tap(code, cid, row, cb):
+    if code == "ed":
+        _arm_edit(row, (cb.get("message") or {}).get("text") or "")
+        return
+    _disarm_edit()   # any other tap ends an armed Edit, on this card or another
+    if code == "ap":
+        rid = post_reply(row, row["draft"], "approved_posted")
+        after = state.get(cid)
+        if rid:
+            tg.edit(row["tg_msg_id"], f"✅ posted to @{row['username']}: {row['draft']}")
+        elif after["status"] in POSTED:   # the bot posted it a moment before the tap landed
+            tg.edit(row["tg_msg_id"], f"🤖 posted to @{row['username']}: {after['reply_text']}")
+        elif after["status"] == "flagged":   # transient glitch or blocked text: keep the buttons
+            icon = "⏳" if (after.get("reason") or "").startswith("queued") else "⚠️ not posted to"
+            wid = tg.send(f"{icon} @{row['username']}: {after['reason']}", reply_to=row["tg_msg_id"])
+            state.set_kv(f"prompt:{wid}", cid)   # replying to the warning still targets this card
+        else:
+            tg.edit(row["tg_msg_id"], f"↩️ did not post to @{row['username']}: {after['reason']}")
+    elif code == "sk":
+        if state.update_if(cid, state.OPEN, status="declined"):
+            tg.edit(row["tg_msg_id"], f"⏭ skipped @{row['username']}: {(row['text'] or '')[:80]}")
+        else:
+            after = state.get(cid)
+            tg.edit(row["tg_msg_id"], f"🤖 posted to @{row['username']}: {after.get('reply_text') or after['status']}")
+
+
+def _handle_text(u):
     msg = u.get("message") or {}
     text = (msg.get("text") or "").strip()
     if not text or msg.get("forward_origin") or msg.get("forward_from") or msg.get("forward_date"):
@@ -885,15 +914,19 @@ def handle_update(u):
     if not row:
         tg.send("Tap Edit on a card first (or reply directly to the card), then type your text. /help")
         return
-    _disarm_edit()   # consumed: put the armed card back before the outcome edit below
-    if row["status"] != "flagged":
-        tg.send(f"@{row['username']} was already handled ({row['status']}).")
-        return
-    clean = text.replace("—", ",")
-    rid = post_reply(row, clean, "edited_posted")
-    after = state.get(row["id"])
+    with _POST_LOCK:
+        _disarm_edit()   # consumed: put the armed card back before the outcome edit below
+        row = state.get(row["id"])
+        if row["status"] != "flagged":
+            tg.send(f"@{row['username']} was already handled ({row['status']}).")
+            return
+        clean = text.replace("—", ",")
+        rid = post_reply(row, clean, "edited_posted")
+        after = state.get(row["id"])
     if rid:
         tg.edit(row["tg_msg_id"], f"✏️ posted your text to @{row['username']}: {clean}")
+    elif after["status"] in POSTED:
+        tg.edit(row["tg_msg_id"], f"🤖 posted to @{row['username']}: {after['reply_text']}")
     elif after["status"] == "flagged":   # blocked wording or a glitch: card stays live, try again
         icon = "⏳" if (after.get("reason") or "").startswith("queued") else "⚠️ not posted:"
         wid = tg.send(f"{icon} {after['reason']}", reply_to=row["tg_msg_id"])
@@ -959,6 +992,10 @@ def main():
                 log("instagram worker died, restarting it")
                 worker = threading.Thread(target=_ig_worker, name="instagram", daemon=True)
                 worker.start()
+            beat = float(state.get_kv("worker_beat", "0") or 0)
+            if beat and time.time() - beat > 1800 and state.get_kv("beat_alerted") != str(int(beat)):
+                state.set_kv("beat_alerted", str(int(beat)))
+                tg.send(f"⚠️ the Instagram side has not ticked for {int(time.time() - beat) // 60} min, it may be stuck")
             for u in tg.get_updates(offset):
                 offset = u["update_id"] + 1
                 state.set_kv("tg_offset", offset)
@@ -1001,8 +1038,16 @@ def _ig_worker():
                 asked = _SWEEP_NOW.is_set()
                 _SWEEP_NOW.clear()
                 next_sweep = time.time() + config.SWEEP_MINUTES * 60
-                if not _paused():
-                    n = sweep()
+                if _paused():
+                    if asked:
+                        tg.send("sweep skipped, the bot is paused")
+                else:
+                    try:
+                        n = sweep()
+                    except Exception as e:
+                        if asked:
+                            tg.send(f"sweep failed: {type(e).__name__}: {str(e)[:150]}")
+                        raise
                     if asked:
                         tg.send(f"sweep done, {n} new comments handled")
             # 3) daily digest
@@ -1011,6 +1056,7 @@ def _ig_worker():
             if config.DIGEST_HOUR >= 0 and now.hour >= config.DIGEST_HOUR and state.get_kv("last_digest") != today:
                 state.set_kv("last_digest", today); digest()
             errors = 0
+            state.set_kv("worker_beat", time.time())
             _SWEEP_NOW.wait(5)   # idle in 5 s steps; a /sweep wakes it at once
         except Exception as e:
             errors += 1
@@ -1020,7 +1066,7 @@ def _ig_worker():
                     tg.send(f"🚨 two errors in a row, still running: {type(e).__name__}: {str(e)[:200]}")
                 except Exception:
                     pass
-            time.sleep(min(60 * errors, 600))
+            _SWEEP_NOW.wait(min(60 * errors, 600))
 
 
 if __name__ == "__main__":
