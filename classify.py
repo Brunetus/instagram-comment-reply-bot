@@ -55,9 +55,15 @@ _HATE_HANDLE = re.compile(
     re.I)
 
 
+# handles Marcus checked by hand and cleared (a pattern match is not proof: "aryian1488" is Aryan Ryan, an Egyptian
+# travel account, Marcus 2026-10-28)
+CLEARED_HANDLES = {"aryian1488"}
+
+
 def hate_handle(username):
     """True if the handle matches a hate-code pattern. The bot neither replies to it nor sends a card."""
-    return bool(_HATE_HANDLE.search(username or ""))
+    u = (username or "").lower()
+    return u not in CLEARED_HANDLES and bool(_HATE_HANDLE.search(u))
 
 
 _ALNUM = re.compile(r"[A-Za-z0-9']+")
