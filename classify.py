@@ -17,7 +17,7 @@ _EMOJI = re.compile(r"^[\s\U0001F000-\U0001FAFF☀-➿⬀-⯿❤️‍⃣!.,]+$"
 _URL = re.compile(r"https?://|www\.|\b[\w-]+\.(com|io|dev|app|ai|co|xyz|in|live|org|net)/\S", re.I)
 _MENTION = re.compile(r"@[\w.]+")
 _SPAM = re.compile(r"contact us|dm me|dm for|follow @|check (out )?my (page|profile|bio)|link in bio|"
-                   r"promo|discount|giveaway|gospel|jesus|repent|forex|crypto signal|whatsapp\W*(me|us|no\.?|number|\+?\d)\b|on whatsapp|"
+                   r"promo|discount|giveaway|gospel|jesus|repent|forex|crypto signal|whatsapp\W*(me|us|no\.?|number|\+?\d+)\b|on whatsapp|"
                    r"wa\.me/|telegram\.me|t\.me/", re.I)   # a bare "WhatsApp" is a joke ("keys in WhatsApp chats"), not spam
 _LAUGH = re.compile(r"\b(lol|lmao|lmfao|hehe|rofl)\b|(ha){2,}|😂|🤣|💀", re.I)
 _FIRE = re.compile(r"\b(fire|facts?|true|fr+|goat|based|agreed?|exactly|yes+|yessir+|yup|yep|same|relatable|"
