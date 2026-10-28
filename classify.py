@@ -45,12 +45,13 @@ _CLOSER = re.compile(r"\b(thanks?|thank you|thx|ty|yeah|yea|yes|yep|ok|okay|got 
 # carded. Kept tight on purpose: a bare "88" is a birth year or a lucky number, so it only counts next to "14", "hh"
 # or a clear marker, and words only count as whole tokens ("nazir", "siegfried", "whitler" stay clean).
 _HATE_HANDLE = re.compile(
-    r"(?<!\d)14[\W_]{0,2}88(?!\d)|(?<!\d)88[\W_]{0,2}14(?!\d)"             # 1488, 14_88, 14.88, 14-88, 8814
-    r"|(?<![a-z])hh[\W_]{0,2}88(?!\d)|(?<!\d)88[\W_]{0,2}hh(?![a-z])"         # hh88 / 88hh (heil hitler)
-    r"|(?<![a-z])(?:ss|heil|reich|sieg)[\W_]{0,2}88(?!\d)"                      # ss88, heil88
-    r"|(?<!\d)88[\W_]{0,2}(?:ss|heil|reich)(?![a-z])"
-    r"|(?<![a-z])(?:sieg[\W_]{0,2}heil|heil[\W_]{0,2}hitler|hitler|nazis?|white[\W_]{0,2}power|wpww|"
-    r"aryan[\W_]{0,2}(?:nation|brotherhood|pride)|zyklon)(?![a-z])",
+    r"(?<!\d)(?<!\d[._])1[._]?4[._]?8[._]?8(?!\d)"     # 1488, 14_88, 14.88, 1_4_8_8 (not a date like 11.14.88)
+    r"|(?<![a-z])h[._]?h[._]?88(?!\d)|(?<!\d)88[._]?hh(?![a-z])"         # hh88 / 88hh (heil hitler)
+    r"|(?<![a-z\d])(?:ss|heil|reich|sieg)[._]?8[._]?8(?!\d)"              # ss88, heil88
+    r"|(?<!\d)88[._]?(?:ss|heil|reich|sieg)(?![a-z])"
+    r"|adolf[._]?hitler|hitler(?:jugend|youth|[._]?88)|zyklon"                   # glued forms ("adolfhitler88")
+    r"|(?<![a-z])(?:sieg[._]?heil|heil[._]?hitler|hitler|nazis?|white[._]?(?:power|pride)[._]?(?:88)?|wpww|"
+    r"aryan[._]?(?:nation|brotherhood|pride))(?![a-z])",
     re.I)
 
 

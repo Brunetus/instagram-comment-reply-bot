@@ -171,6 +171,24 @@ def already_answered(cm):
 
 
 # ---------- posting ----------
+def _handle_of(cm):
+    cm = dict(cm)
+    return cm.get("username") or (cm.get("from") or {}).get("username") or ""
+
+
+def _drop_hate_handle(cm):
+    """A hate-code handle (classify.hate_handle): settle the row as skipped and take any card down. True if dropped."""
+    if not classify.hate_handle(_handle_of(cm)):
+        return False
+    cid = dict(cm)["id"]
+    row = state.get(cid) or {}
+    if state.update_if(cid, state.OPEN, status="skipped", tier="skip", reason="handle matches a hate-code pattern") \
+            and row.get("tg_msg_id"):
+        tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], "⏭ skipped: handle matches a hate-code pattern")
+    log(f"skip: @{_handle_of(cm)} (handle matches a hate-code pattern)")
+    return True
+
+
 def post_reply(cm, text, status):
     """Posts `text` for comment `cm` (API dict or state dict). Returns the reply id, or None if it stood down.
     Serialised across threads: a tap and the catch-up may hold the same comment, so the row is re-read under the lock
@@ -180,9 +198,7 @@ def post_reply(cm, text, status):
         if cur and cur["status"] not in state.OPEN:
             log(f"stand down (already {cur['status']}): @{cur['username']} {cur['id']}")
             return None
-        if status.startswith("auto") and classify.hate_handle(dict(cm).get("username") or (dict(cm).get("from") or {}).get("username")):
-            state.update_if(dict(cm)["id"], state.OPEN, status="skipped", tier="skip", reason="handle matches a hate-code pattern")
-            log(f"stand down (hate-code handle): {dict(cm)['id']}")
+        if status.startswith("auto") and _drop_hate_handle(cm):
             return None   # backstop: the classifier already skips these; Marcus's own taps still go through
         pe = _pending_edit() if status.startswith("auto") else None
         if pe and pe.get("cid") == dict(cm)["id"]:   # Marcus tapped Edit on this one: his text is coming
@@ -415,6 +431,8 @@ def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
 
 
 def flag_to_marcus(cm, thread, label, caption, note=None, pre=None):
+    if _drop_hate_handle(cm):   # never a card for these, whichever path got here (lead keyword included)
+        return
     d = pre or draft.draft(cm, thread, caption, label)   # pre: a draft already made for this comment
     if note:
         label = f"{label} {note}"
@@ -509,6 +527,8 @@ def _catchup_one(row):
     cm = {"id": row["id"], "text": row["text"], "timestamp": row["timestamp"],
           "from": {"username": row["username"]}, "parent_id": row.get("parent_id")}
     top_id = row.get("parent_id") or row["id"]
+    if _drop_hate_handle(row):
+        return 0
     # cheap pre-pass on what the db already knows: closers and tags are filed without an API call
     pre_tier, pre_reason, _ = classify.classify(cm, state.thread_rows(top_id) + [cm])
     if pre_tier in ("skip", "signoff") and not _LEAD.match(cm.get("text") or ""):
@@ -984,6 +1004,13 @@ def main():
         state.set_kv("requeued_neg_holds", "2026-10-26")
         n = state.requeue(reason_like="%negative, hostile or crude wording%")
         log(f"re-queued {n} cards held by the old negative-word list")
+    if state.get_kv("dropped_hate_handles") != "2026-10-28":
+        state.set_kv("dropped_hate_handles", "2026-10-28")
+        try:
+            n = sum(_drop_hate_handle(r) for st in state.OPEN for r in state.rows(status=st))
+            log(f"dropped {n} open rows from hate-code handles")
+        except Exception as e:
+            log("hate-handle pass failed", repr(e))
     if config.AUTO_POST and state.get_kv("settled_short_cards") != "2026-10-08":
         state.set_kv("settled_short_cards", "2026-10-08")   # once, even if the pass itself errors out
         try:
