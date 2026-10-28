@@ -160,6 +160,9 @@ def already_answered(cm):
             return v
         log("guard: could not fetch thread:", str(e)[:160])
         return None
+    if cm.get("parent_id") and not any(c["id"] == cm["id"] for c in thread):
+        _LAST_GUARD_ERR[0] = "comment not in its thread any more (deleted)"
+        return None   # the reply was deleted: never answer a comment that is gone
     for c in thread:
         if c["id"] == cm["id"]:
             continue
@@ -292,6 +295,7 @@ def retry_queued(limit=5):
             state.set_kv(k, ""); continue
         if int(job.get("tries", 0)) >= 8:
             state.set_kv(k, "")
+            state.update_if(cid, ("flagged",), status="error", reason="gave up after 8 tries")
             if row.get("tg_msg_id"):
                 tg.send(f"⚠️ gave up on @{row['username']} after 8 tries, Instagram kept throttling. Tap Approve again later.",
                         reply_to=row["tg_msg_id"])
@@ -301,6 +305,8 @@ def retry_queued(limit=5):
             rid = post_reply(row, job["text"], job["status"])
         except Exception as e:
             log("retry failed", repr(e)[:120]); state.set_kv(k, ""); continue
+        if not rid and state.get_kv(k) == raw and (state.get(cid) or {}).get("status") == "flagged":
+            _queue_retry(cid, job["text"], job["status"])   # stood down without re-queueing (glitch, refusal): count the try
         if rid and row.get("tg_msg_id"):
             icon = "✏️ posted your text" if job["status"] == "edited_posted" else "✅ posted"
             if job["status"] == "auto_drafted":
@@ -437,6 +443,9 @@ def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
 def flag_to_marcus(cm, thread, label, caption, note=None, pre=None):
     if _drop_hate_handle(cm):   # never a card for these, whichever path got here (lead keyword included)
         return
+    if (state.get(cm["id"]) or {}).get("reason") == "friend tag, drafted":   # not worth a card on his phone
+        state.update_if(cm["id"], state.OPEN, status="skipped", tier="skip", reason="friend tag, no draft good enough to post")
+        return
     d = pre or draft.draft(cm, thread, caption, label)   # pre: a draft already made for this comment
     if note:
         label = f"{label} {note}"
@@ -529,7 +538,7 @@ class RateLimited(Exception):
 def _catchup_one(row):
     """One backlog row. Returns 1 when it was acted on, 0 when it was only re-filed."""
     cm = {"id": row["id"], "text": row["text"], "timestamp": row["timestamp"],
-          "from": {"username": row["username"]}, "parent_id": row.get("parent_id")}
+          "from": {"username": row["username"]}, "parent_id": row.get("parent_id"), "_db": True}
     top_id = row.get("parent_id") or row["id"]
     if _drop_hate_handle(row):
         return 0
@@ -659,7 +668,6 @@ def load_backfill():
     tag = hashlib.sha1(raw).hexdigest()[:12]
     if state.get_kv("backfill_loaded") == tag:
         return 0
-    state.set_kv("backfill_loaded", tag)
     n = 0
     for e in json.loads(raw):
         if e.get("action") != "post" or not e.get("cid") or not e.get("reply"):
@@ -670,9 +678,10 @@ def load_backfill():
                                reason="backfill: reply Marcus approved for a comment the bot had skipped"):
             continue   # not in the db, or already answered some other way
         state.set_kv(f"retry:{e['cid']}", json.dumps({"text": e["reply"], "status": "approved_posted", "tries": 0,
-                                                      "at": time.time()}))
+                                                      "at": time.time() + 600 * n}))   # one every 10 min
         n += 1
-    log(f"backfill: queued {n} approved replies")
+    state.set_kv("backfill_loaded", tag)
+    log(f"backfill: queued {n} approved replies, one every 10 min")
     return n
 
 
@@ -807,7 +816,7 @@ def _status_text():
     c = {s: len(state.rows(status=s, since=day)) for s in
          ("auto_posted", "auto_drafted", "flagged", "approved_posted", "edited_posted", "declined", "skipped", "signoff",
           "answered_manually", "error")}
-    waiting = len(state.rows(status="flagged"))
+    waiting = len([r for r in state.rows(status="flagged") if not (r.get("reason") or "").startswith("backfill")])
     lines += ["", f"Last 24h: auto emoji {c['auto_posted']} · auto drafts {c['auto_drafted']} · approved {c['approved_posted']} · edited {c['edited_posted']} · "
                   f"declined {c['declined']} · skipped {c['skipped']+c['signoff']} · you beat me to {c['answered_manually']}"
                   + (f" · errors {c['error']}" if c['error'] else ""),
@@ -1005,7 +1014,7 @@ def digest():
     auto = state.rows(status="auto_posted", since=day)
     skipped = state.rows(status="skipped", since=day) + state.rows(status="signoff", since=day)
     errors = state.rows(status="error", since=day)
-    waiting = state.rows(status="flagged")
+    waiting = [r for r in state.rows(status="flagged") if not (r.get("reason") or "").startswith("backfill")]
     lines = ["☀️ Daily digest", "", _status_text(), ""]
     drafted = state.rows(status="auto_drafted", since=day)
     if drafted:

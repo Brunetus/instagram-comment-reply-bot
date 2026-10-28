@@ -17,7 +17,7 @@ _EMOJI = re.compile(r"^[\s\U0001F000-\U0001FAFF☀-➿⬀-⯿❤️‍⃣!.,]+$"
 _URL = re.compile(r"https?://|www\.|\b[\w-]+\.(com|io|dev|app|ai|co|xyz|in|live|org|net)/\S", re.I)
 _MENTION = re.compile(r"@[\w.]+")
 _SPAM = re.compile(r"contact us|dm me|dm for|follow @|check (out )?my (page|profile|bio)|link in bio|"
-                   r"promo|discount|giveaway|gospel|jesus|repent|forex|crypto signal|whatsapp\s*(me|us|\+?\d)|on whatsapp|"
+                   r"promo|discount|giveaway|gospel|jesus|repent|forex|crypto signal|whatsapp\W*(me|us|no\.?|number|\+?\d)|on whatsapp|"
                    r"wa\.me/|telegram\.me|t\.me/", re.I)   # a bare "WhatsApp" is a joke ("keys in WhatsApp chats"), not spam
 _LAUGH = re.compile(r"\b(lol|lmao|lmfao|hehe|rofl)\b|(ha){2,}|😂|🤣|💀", re.I)
 _FIRE = re.compile(r"\b(fire|facts?|true|fr+|goat|based|agreed?|exactly|yes+|yessir+|yup|yep|same|relatable|"
@@ -85,7 +85,8 @@ def classify(cm, thread):
     if hate_handle(user):
         return "skip", "handle matches a hate-code pattern", None
     if not text:
-        if not cm.get("parent_id"):   # a GIF or sticker on the reel itself: a friendly emoji back (2026-10-28)
+        if not cm.get("parent_id") and not cm.get("_db"):   # a GIF or sticker on the reel, seen live: 🙌 back (2026-10-28)
+            # (_db: rebuilt from the db, where a missing text is also "", so the catch-up never guesses)
             return "auto", "sticker/gif", "🙌"
         return "skip", "no text (sticker/gif)", None   # inside a thread we can't tell who it is aimed at
     stripped = _MENTION.sub("", text).strip()
