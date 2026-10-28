@@ -17,7 +17,8 @@ _EMOJI = re.compile(r"^[\s\U0001F000-\U0001FAFF☀-➿⬀-⯿❤️‍⃣!.,]+$"
 _URL = re.compile(r"https?://|www\.|\b[\w-]+\.(com|io|dev|app|ai|co|xyz|in|live|org|net)/\S", re.I)
 _MENTION = re.compile(r"@[\w.]+")
 _SPAM = re.compile(r"contact us|dm me|dm for|follow @|check (out )?my (page|profile|bio)|link in bio|"
-                   r"promo|discount|giveaway|gospel|jesus|repent|forex|crypto signal|whatsapp|telegram\.me|t\.me/", re.I)
+                   r"promo|discount|giveaway|gospel|jesus|repent|forex|crypto signal|whatsapp\s*(me|us|\+?\d)|on whatsapp|"
+                   r"wa\.me/|telegram\.me|t\.me/", re.I)   # a bare "WhatsApp" is a joke ("keys in WhatsApp chats"), not spam
 _LAUGH = re.compile(r"\b(lol|lmao|lmfao|hehe|rofl)\b|(ha){2,}|😂|🤣|💀", re.I)
 _FIRE = re.compile(r"\b(fire|facts?|true|fr+|goat|based|agreed?|exactly|yes+|yessir+|yup|yep|same|relatable|"
                    r"preach|absolutely|accurate|correct|legend|respect|king|peak|valid|let'?s go+)\b|🔥|🙌|👏|💯|🐐", re.I)
@@ -67,6 +68,9 @@ def hate_handle(username):
 
 
 _ALNUM = re.compile(r"[A-Za-z0-9']+")
+# slurs, sexual and self-harm wording: never answered without Marcus (bot.py holds flag-tier drafts on it too)
+_CRUDE = re.compile(r"\b(kys|kill yourself|bitch\w*|retard\w*|rape\w*|nazi\w*|jew\w*|gay|fag\w*|tranny|slut\w*|whore\w*|"
+                    r"porn\w*|onlyfans|nudes?|dick|pussy|pussies|cum|n[i1]gg\w*)\b", re.I)
 
 
 def _words(t):
@@ -81,7 +85,9 @@ def classify(cm, thread):
     if hate_handle(user):
         return "skip", "handle matches a hate-code pattern", None
     if not text:
-        return "skip", "no text (sticker/gif)", None
+        if not cm.get("parent_id"):   # a GIF or sticker on the reel itself: a friendly emoji back (2026-10-28)
+            return "auto", "sticker/gif", "🙌"
+        return "skip", "no text (sticker/gif)", None   # inside a thread we can't tell who it is aimed at
     stripped = _MENTION.sub("", text).strip()
     mentions = _MENTION.findall(text)
     mentions_me = any(m.lower() == f"@{ME}".lower() for m in mentions)
@@ -89,7 +95,9 @@ def classify(cm, thread):
     if _SPAM.search(text) or (_URL.search(text) and not _QUESTION.search(text)):
         return "skip", "promo/spam or bare link", None
     if mentions and not mentions_me and len(_words(stripped)) <= 4 and "?" not in stripped:
-        return "skip", "friend tag", None
+        if cm.get("parent_id") or _CRUDE.search(stripped):   # friends chatting inside a thread, or crude: stay out
+            return "skip", "friend tag", None
+        return "flag", "friend tag, drafted", None   # someone sharing the reel with a friend: a short line back (2026-10-28)
 
     is_reply = bool(cm.get("parent_id"))
     if is_reply and not mentions_me:

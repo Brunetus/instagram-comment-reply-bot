@@ -14,7 +14,9 @@ Invariants (also the audit brief):
   * Content rules are enforced in code on every outgoing text (em dash, "zero coding", DM promises).
 """
 import datetime as dt
+import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -342,8 +344,7 @@ _LEAD = re.compile(r"^\W*(money)\W*$", re.I)   # comment keywords that mean "sen
 # slurs, sexual content, self-harm: a human decides these, never the critic alone. Mild swearing ("shit", "damn"),
 # "sexy" (the reels' own premise) and plain negation ("not", "no", "nah") go to the critic, which judges tone
 # (2026-10-26: the old word list held 19 of 31 friendly comments for words like "not alone" and "bro cooked").
-_CRUDE = re.compile(r"\b(kys|kill yourself|bitch\w*|retard\w*|rape\w*|nazi\w*|jew\w*|gay|fag\w*|tranny|slut\w*|whore\w*|"
-                    r"porn\w*|onlyfans|nudes?|dick|pussy|cum|n[i1]gg\w*)\b", re.I)
+_CRUDE = classify._CRUDE
 _LAST_AUTO = [0.0]
 _LAST_GUARD_ERR = [""]
 POSTED = ("approved_posted", "edited_posted", "auto_posted", "auto_drafted")
@@ -609,6 +610,8 @@ def reconcile_open_cards():
     for row in state.rows(status="flagged"):
         if (row.get("created_at") or 0) < week:   # old cards are not worth two API calls every half hour
             continue
+        if not row.get("tg_msg_id"):   # no card to take down; post_reply re-checks the thread before any post
+            continue
         try:
             verdict = already_answered(row)
         except Exception as e:
@@ -640,6 +643,36 @@ def reconcile_open_cards():
             except Exception as e:
                 log("reconcile: card edit failed", repr(e))
         log(f"reconcile: @{row['username']} answered in the app, card removed")
+    return n
+
+
+BACKFILL = os.path.join(os.path.dirname(__file__), "backfill.json")
+
+
+def load_backfill():
+    """One-time, at startup: replies Marcus approved for comments the bot had skipped. backfill.json is gitignored
+    (other people's comments) and ships in the image only. Each entry is queued on the retry queue, so it posts
+    through post_reply's live thread check, 5 per poll, and is recorded as the bot's own reply."""
+    if not os.path.exists(BACKFILL):
+        return 0
+    raw = open(BACKFILL, "rb").read()
+    tag = hashlib.sha1(raw).hexdigest()[:12]
+    if state.get_kv("backfill_loaded") == tag:
+        return 0
+    state.set_kv("backfill_loaded", tag)
+    n = 0
+    for e in json.loads(raw):
+        if e.get("action") != "post" or not e.get("cid") or not e.get("reply"):
+            continue
+        if content_violation(e["reply"]):
+            log(f"backfill: refused @{e.get('user')} ({content_violation(e['reply'])})"); continue
+        if not state.update_if(e["cid"], ("skipped", "signoff"), status="flagged", draft=e["reply"], needs_marcus=1,
+                               reason="backfill: reply Marcus approved for a comment the bot had skipped"):
+            continue   # not in the db, or already answered some other way
+        state.set_kv(f"retry:{e['cid']}", json.dumps({"text": e["reply"], "status": "approved_posted", "tries": 0,
+                                                      "at": time.time()}))
+        n += 1
+    log(f"backfill: queued {n} approved replies")
     return n
 
 
@@ -1007,6 +1040,10 @@ def main():
         state.set_kv("requeued_neg_holds", "2026-10-26")
         n = state.requeue(reason_like="%negative, hostile or crude wording%")
         log(f"re-queued {n} cards held by the old negative-word list")
+    try:
+        load_backfill()
+    except Exception as e:
+        log("backfill load failed", repr(e))
     if state.get_kv("dropped_hate_handles") != "2026-10-28":
         state.set_kv("dropped_hate_handles", "2026-10-28")
         try:
