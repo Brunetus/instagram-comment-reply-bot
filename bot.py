@@ -183,8 +183,11 @@ def _drop_hate_handle(cm):
     cid = dict(cm)["id"]
     row = state.get(cid) or {}
     if state.update_if(cid, state.OPEN, status="skipped", tier="skip", reason="handle matches a hate-code pattern") \
-            and row.get("tg_msg_id"):
-        tg.delete(row["tg_msg_id"]) or tg.edit(row["tg_msg_id"], "⏭ skipped: handle matches a hate-code pattern")
+            and row.get("tg_msg_id") and not tg.delete(row["tg_msg_id"]):
+        try:
+            tg.edit(row["tg_msg_id"], "⏭ skipped: handle matches a hate-code pattern")
+        except Exception as e:
+            log("hate-handle card edit failed", repr(e))
     log(f"skip: @{_handle_of(cm)} (handle matches a hate-code pattern)")
     return True
 
