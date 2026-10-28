@@ -161,8 +161,12 @@ def already_answered(cm):
         log("guard: could not fetch thread:", str(e)[:160])
         return None
     if cm.get("parent_id") and not any(c["id"] == cm["id"] for c in thread):
-        _LAST_GUARD_ERR[0] = "comment not in its thread any more (deleted)"
-        return None   # the reply was deleted: never answer a comment that is gone
+        try:   # /replies can lag or hide a reply: only a confirmed deletion blocks the post
+            ig.comment(cm["id"])
+        except ig.IGError as e:
+            if "does not exist" in str(e):
+                _LAST_GUARD_ERR[0] = "comment deleted"
+                return None   # never answer a comment that is gone
     for c in thread:
         if c["id"] == cm["id"]:
             continue
