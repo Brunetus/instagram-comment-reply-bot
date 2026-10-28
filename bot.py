@@ -14,7 +14,9 @@ Invariants (also the audit brief):
   * Content rules are enforced in code on every outgoing text (em dash, "zero coding", DM promises).
 """
 import datetime as dt
+import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -158,6 +160,13 @@ def already_answered(cm):
             return v
         log("guard: could not fetch thread:", str(e)[:160])
         return None
+    if cm.get("parent_id") and not any(c["id"] == cm["id"] for c in thread):
+        try:   # /replies can lag or hide a reply: only a confirmed deletion blocks the post
+            ig.comment(cm["id"])
+        except ig.IGError as e:
+            if "does not exist" in str(e):
+                _LAST_GUARD_ERR[0] = "comment deleted"
+                return None   # never answer a comment that is gone
     for c in thread:
         if c["id"] == cm["id"]:
             continue
@@ -290,6 +299,7 @@ def retry_queued(limit=5):
             state.set_kv(k, ""); continue
         if int(job.get("tries", 0)) >= 8:
             state.set_kv(k, "")
+            state.update_if(cid, ("flagged",), status="error", reason="gave up after 8 tries")
             if row.get("tg_msg_id"):
                 tg.send(f"⚠️ gave up on @{row['username']} after 8 tries, Instagram kept throttling. Tap Approve again later.",
                         reply_to=row["tg_msg_id"])
@@ -299,6 +309,8 @@ def retry_queued(limit=5):
             rid = post_reply(row, job["text"], job["status"])
         except Exception as e:
             log("retry failed", repr(e)[:120]); state.set_kv(k, ""); continue
+        if not rid and state.get_kv(k) == raw and (state.get(cid) or {}).get("status") == "flagged":
+            _queue_retry(cid, job["text"], job["status"])   # stood down without re-queueing (glitch, refusal): count the try
         if rid and row.get("tg_msg_id"):
             icon = "✏️ posted your text" if job["status"] == "edited_posted" else "✅ posted"
             if job["status"] == "auto_drafted":
@@ -342,8 +354,7 @@ _LEAD = re.compile(r"^\W*(money)\W*$", re.I)   # comment keywords that mean "sen
 # slurs, sexual content, self-harm: a human decides these, never the critic alone. Mild swearing ("shit", "damn"),
 # "sexy" (the reels' own premise) and plain negation ("not", "no", "nah") go to the critic, which judges tone
 # (2026-10-26: the old word list held 19 of 31 friendly comments for words like "not alone" and "bro cooked").
-_CRUDE = re.compile(r"\b(kys|kill yourself|bitch\w*|retard\w*|rape\w*|nazi\w*|jew\w*|gay|fag\w*|tranny|slut\w*|whore\w*|"
-                    r"porn\w*|onlyfans|nudes?|dick|pussy|cum|n[i1]gg\w*)\b", re.I)
+_CRUDE = classify._CRUDE
 _LAST_AUTO = [0.0]
 _LAST_GUARD_ERR = [""]
 POSTED = ("approved_posted", "edited_posted", "auto_posted", "auto_drafted")
@@ -435,6 +446,9 @@ def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
 
 def flag_to_marcus(cm, thread, label, caption, note=None, pre=None):
     if _drop_hate_handle(cm):   # never a card for these, whichever path got here (lead keyword included)
+        return
+    if (state.get(cm["id"]) or {}).get("reason") == "friend tag, drafted":   # not worth a card on his phone
+        state.update_if(cm["id"], state.OPEN, status="skipped", tier="skip", reason="friend tag, no draft good enough to post")
         return
     d = pre or draft.draft(cm, thread, caption, label)   # pre: a draft already made for this comment
     if note:
@@ -528,7 +542,7 @@ class RateLimited(Exception):
 def _catchup_one(row):
     """One backlog row. Returns 1 when it was acted on, 0 when it was only re-filed."""
     cm = {"id": row["id"], "text": row["text"], "timestamp": row["timestamp"],
-          "from": {"username": row["username"]}, "parent_id": row.get("parent_id")}
+          "from": {"username": row["username"]}, "parent_id": row.get("parent_id"), "_db": True}
     top_id = row.get("parent_id") or row["id"]
     if _drop_hate_handle(row):
         return 0
@@ -609,6 +623,8 @@ def reconcile_open_cards():
     for row in state.rows(status="flagged"):
         if (row.get("created_at") or 0) < week:   # old cards are not worth two API calls every half hour
             continue
+        if not row.get("tg_msg_id"):   # no card to take down; post_reply re-checks the thread before any post
+            continue
         try:
             verdict = already_answered(row)
         except Exception as e:
@@ -640,6 +656,36 @@ def reconcile_open_cards():
             except Exception as e:
                 log("reconcile: card edit failed", repr(e))
         log(f"reconcile: @{row['username']} answered in the app, card removed")
+    return n
+
+
+BACKFILL = os.path.join(os.path.dirname(__file__), "backfill.json")
+
+
+def load_backfill():
+    """One-time, at startup: replies Marcus approved for comments the bot had skipped. backfill.json is gitignored
+    (other people's comments) and ships in the image only. Each entry is queued on the retry queue, so it posts
+    through post_reply's live thread check, 5 per poll, and is recorded as the bot's own reply."""
+    if not os.path.exists(BACKFILL):
+        return 0
+    raw = open(BACKFILL, "rb").read()
+    tag = hashlib.sha1(raw).hexdigest()[:12]
+    if state.get_kv("backfill_loaded") == tag:
+        return 0
+    n = 0
+    for e in json.loads(raw):
+        if e.get("action") != "post" or not e.get("cid") or not e.get("reply"):
+            continue
+        if content_violation(e["reply"]):
+            log(f"backfill: refused @{e.get('user')} ({content_violation(e['reply'])})"); continue
+        if not state.update_if(e["cid"], ("skipped", "signoff"), status="flagged", draft=e["reply"], needs_marcus=1,
+                               reason="backfill: reply Marcus approved for a comment the bot had skipped"):
+            continue   # not in the db, or already answered some other way
+        state.set_kv(f"retry:{e['cid']}", json.dumps({"text": e["reply"], "status": "approved_posted", "tries": 0,
+                                                      "at": time.time() + 600 * n}))   # one every 10 min
+        n += 1
+    state.set_kv("backfill_loaded", tag)
+    log(f"backfill: queued {n} approved replies, one every 10 min")
     return n
 
 
@@ -774,7 +820,7 @@ def _status_text():
     c = {s: len(state.rows(status=s, since=day)) for s in
          ("auto_posted", "auto_drafted", "flagged", "approved_posted", "edited_posted", "declined", "skipped", "signoff",
           "answered_manually", "error")}
-    waiting = len(state.rows(status="flagged"))
+    waiting = len([r for r in state.rows(status="flagged") if not (r.get("reason") or "").startswith("backfill")])
     lines += ["", f"Last 24h: auto emoji {c['auto_posted']} · auto drafts {c['auto_drafted']} · approved {c['approved_posted']} · edited {c['edited_posted']} · "
                   f"declined {c['declined']} · skipped {c['skipped']+c['signoff']} · you beat me to {c['answered_manually']}"
                   + (f" · errors {c['error']}" if c['error'] else ""),
@@ -972,7 +1018,7 @@ def digest():
     auto = state.rows(status="auto_posted", since=day)
     skipped = state.rows(status="skipped", since=day) + state.rows(status="signoff", since=day)
     errors = state.rows(status="error", since=day)
-    waiting = state.rows(status="flagged")
+    waiting = [r for r in state.rows(status="flagged") if not (r.get("reason") or "").startswith("backfill")]
     lines = ["☀️ Daily digest", "", _status_text(), ""]
     drafted = state.rows(status="auto_drafted", since=day)
     if drafted:
@@ -1007,6 +1053,10 @@ def main():
         state.set_kv("requeued_neg_holds", "2026-10-26")
         n = state.requeue(reason_like="%negative, hostile or crude wording%")
         log(f"re-queued {n} cards held by the old negative-word list")
+    try:
+        load_backfill()
+    except Exception as e:
+        log("backfill load failed", repr(e))
     if state.get_kv("dropped_hate_handles") != "2026-10-28":
         state.set_kv("dropped_hate_handles", "2026-10-28")
         try:
