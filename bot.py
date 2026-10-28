@@ -284,6 +284,7 @@ def _queue_retry(cid, text, status):
 def retry_queued(limit=5):
     """Replies Instagram throttled: post them when their time comes (same guard as any post). Gives up after 8 tries."""
     n = 0
+    backfill_done = False
     for k, raw in state.kv_prefix("retry:"):
         if n >= limit or not raw:
             continue
@@ -297,6 +298,10 @@ def retry_queued(limit=5):
         row = state.get(cid)
         if not row or row["status"] != "flagged":
             state.set_kv(k, ""); continue
+        if (row.get("reason") or "").startswith("backfill"):
+            if backfill_done:   # at most one backfill reply per poll, however overdue the queue is
+                continue
+            backfill_done = True
         if int(job.get("tries", 0)) >= 8:
             state.set_kv(k, "")
             state.update_if(cid, ("flagged",), status="error", reason="gave up after 8 tries")
