@@ -180,6 +180,10 @@ def post_reply(cm, text, status):
         if cur and cur["status"] not in state.OPEN:
             log(f"stand down (already {cur['status']}): @{cur['username']} {cur['id']}")
             return None
+        if status.startswith("auto") and classify.hate_handle(dict(cm).get("username") or (dict(cm).get("from") or {}).get("username")):
+            state.update_if(dict(cm)["id"], state.OPEN, status="skipped", tier="skip", reason="handle matches a hate-code pattern")
+            log(f"stand down (hate-code handle): {dict(cm)['id']}")
+            return None   # backstop: the classifier already skips these; Marcus's own taps still go through
         pe = _pending_edit() if status.startswith("auto") else None
         if pe and pe.get("cid") == dict(cm)["id"]:   # Marcus tapped Edit on this one: his text is coming
             log(f"stand down (Edit armed): @{dict(cm)['username']}")

@@ -41,6 +41,24 @@ _CLOSER = re.compile(r"\b(thanks?|thank you|thx|ty|yeah|yea|yes|yep|ok|okay|got 
                      r"same|true|fr|haha+|lol|amen|bro|man|noted|facts|real|cool|nice|ooh|wow|love it|agreed?)\b|🙌|❤️|👍|🫡|😂|🔥|👏", re.I)
 
 
+# handles carrying a hate code (Grok/Marc, 2026-10-28, after an auto ❤️ went to "...1488"): never answered, never
+# carded. Kept tight on purpose: a bare "88" is a birth year or a lucky number, so it only counts next to "14", "hh"
+# or a clear marker, and words only count as whole tokens ("nazir", "siegfried", "whitler" stay clean).
+_HATE_HANDLE = re.compile(
+    r"(?<!\d)14[\W_]{0,2}88(?!\d)|(?<!\d)88[\W_]{0,2}14(?!\d)"             # 1488, 14_88, 14.88, 14-88, 8814
+    r"|(?<![a-z])hh[\W_]{0,2}88(?!\d)|(?<!\d)88[\W_]{0,2}hh(?![a-z])"         # hh88 / 88hh (heil hitler)
+    r"|(?<![a-z])(?:ss|heil|reich|sieg)[\W_]{0,2}88(?!\d)"                      # ss88, heil88
+    r"|(?<!\d)88[\W_]{0,2}(?:ss|heil|reich)(?![a-z])"
+    r"|(?<![a-z])(?:sieg[\W_]{0,2}heil|heil[\W_]{0,2}hitler|hitler|nazis?|white[\W_]{0,2}power|wpww|"
+    r"aryan[\W_]{0,2}(?:nation|brotherhood|pride)|zyklon)(?![a-z])",
+    re.I)
+
+
+def hate_handle(username):
+    """True if the handle matches a hate-code pattern. The bot neither replies to it nor sends a card."""
+    return bool(_HATE_HANDLE.search(username or ""))
+
+
 _ALNUM = re.compile(r"[A-Za-z0-9']+")
 
 
@@ -53,6 +71,8 @@ def classify(cm, thread):
     Returns (tier, reason, auto_reply_text_or_None)."""
     text = (cm.get("text") or "").strip()
     user = (cm.get("from") or {}).get("username", "")
+    if hate_handle(user):
+        return "skip", "handle matches a hate-code pattern", None
     if not text:
         return "skip", "no text (sticker/gif)", None
     stripped = _MENTION.sub("", text).strip()
