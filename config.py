@@ -46,6 +46,8 @@ CATCHUP_SINCE = env("CATCHUP_SINCE", "2026-10-01")   # unanswered comments this 
 CATCHUP_PER_POLL = int(env("CATCHUP_PER_POLL", "3"))
 CATCHUP_SECONDS = int(env("CATCHUP_SECONDS", "120"))   # wall-clock cap per poll so Telegram taps are never starved
 NEWEST_N = int(env("NEWEST_N", "3"))
+RECONCILE_EVERY = max(1, int(env("RECONCILE_EVERY", "6")))   # polls between open-card checks (6 x 10 min = hourly)
+RECONCILE_MAX = max(1, int(env("RECONCILE_MAX", "10")))     # newest open cards checked per run
 SWEEP_MINUTES = int(env("SWEEP_MINUTES", "60"))    # every reel on the account is swept this often (hot 7 are every POLL_SECONDS)
 SWEEP_HOURS = int(env("SWEEP_HOURS", "48"))        # a sweep looks this far back on each reel
 POST_GAP_SECONDS = float(env("POST_GAP_SECONDS", "4"))
