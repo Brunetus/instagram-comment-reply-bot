@@ -618,14 +618,14 @@ def _rate_limited(e):
     return "request limit" in str(e).lower() or '"code":4,' in str(e) or '"code": 4,' in str(e)
 
 
-def reconcile_open_cards():
+def reconcile_open_cards(force=False):
     """Every poll (Marcus, 2026-10-10): any open card whose comment he has since answered in the app is taken
     off the Telegram queue, so a tap can never double-reply. Same live thread check as before a post."""
     n = 0
     # 2026-10-28: walking every open card tripped Instagram's comment limit at the start of each reply window
     # (178 cards that day, 0 removed), starving the retry queue. Hourly now, newest cards only; the tap-time
     # guard still protects every post, so a card left up can never double-reply.
-    if int(state.get_kv("poll_no", "0")) % config.RECONCILE_EVERY:
+    if not force and int(state.get_kv("poll_no", "0")) % config.RECONCILE_EVERY:   # /reconcile runs it now
         return 0
     week = time.time() - 7 * 86400
     cards = [r for r in state.rows(status="flagged")   # no card = nothing to take down; old cards not worth the calls
@@ -974,7 +974,7 @@ def _handle_text(u):
         elif cmd == "/resume":
             state.set_kv("paused", "0"); tg.send("▶️ resumed.")
         elif cmd == "/reconcile":
-            n = reconcile_open_cards(); tg.send(f"✋ {n} card(s) removed, you had answered those in the app." if n else "nothing to remove")
+            n = reconcile_open_cards(force=True); tg.send(f"✋ {n} card(s) removed, you had answered those in the app." if n else "nothing to remove")
         elif cmd == "/cancel":
             tg.send("✖ edit cancelled" if _pending_edit() else "nothing to cancel"); _disarm_edit()
         elif cmd == "/status":
