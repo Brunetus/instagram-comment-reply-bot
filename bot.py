@@ -92,6 +92,7 @@ def _author(c):
 
 _THREAD_CACHE = {}     # top_id -> (fetched_at, items): read paths reuse a thread for 5 min
 _NODE_COOLDOWN = {}    # top_id -> until: Instagram rate-limits a single hot comment node; leave it alone a while
+_PAGING_REFUSED = {}   # top_id -> next-page refusals in a row; each one doubles the thread's cooldown
 
 
 def _node_limited(e):
@@ -106,6 +107,8 @@ def thread_of(top_id, fresh=False):
     if not fresh and hit and now - hit[0] < 300:
         return [dict(c) for c in hit[1]]
     if _NODE_COOLDOWN.get(top_id, 0) > now:
+        if top_id in _PAGING_REFUSED:   # deliberately not _node_limited: the guard stands down, no reel check for this long
+            raise ig.IGError(f"thread {top_id} left alone, Instagram refused its next page")
         raise ig.IGError(f"node {top_id} cooling down after Instagram rate-limits on the node")
     try:
         top = ig.comment(top_id)
@@ -115,9 +118,15 @@ def thread_of(top_id, fresh=False):
             r["from"] = {"username": _author(r) or "?"}
             items.append(r)
     except ig.IGError as e:
-        if _node_limited(e):
+        if isinstance(e, ig.PagingRefused):   # a thread whose next page is refused trips the limit every time it's walked
+            n = _PAGING_REFUSED[top_id] = _PAGING_REFUSED.get(top_id, 0) + 1
+            hours = min(2 ** n, 24)
+            _NODE_COOLDOWN[top_id] = now + hours * 3600
+            log(f"thread {top_id} left alone for {hours}h: {e}")
+        elif _node_limited(e):
             _NODE_COOLDOWN[top_id] = now + 1800
         raise
+    _PAGING_REFUSED.pop(top_id, None)
     items = sorted(items, key=lambda c: c["timestamp"])
     _THREAD_CACHE[top_id] = (now, items)
     return [dict(c) for c in items]
@@ -154,7 +163,7 @@ def already_answered(cm):
         thread = thread_of(top_id, fresh=True)
     except ig.IGError as e:
         _LAST_GUARD_ERR[0] = str(e)
-        if _node_limited(e):   # only this comment is throttled: verify through the reel instead
+        if _node_limited(e) and not isinstance(e, ig.PagingRefused):   # only this comment is throttled: verify through the reel instead
             v = _answered_via_media(cm)
             log(f"guard: node limited, checked via the reel instead -> {v}")
             return v
@@ -237,7 +246,9 @@ def _post_reply(cm, text, status):
     verdict = already_answered(cm)
     if verdict is None:
         # transient: keep the card live so Marcus can simply tap again
-        why = ("Instagram is throttling reads right now, try again in 10-15 min" if _rate_limited(_LAST_GUARD_ERR[0])
+        why = ("Instagram won't give me this whole thread, so I can't verify it for now. Reply in the app if it matters"
+               if "refused its next page" in _LAST_GUARD_ERR[0] or "paging failed" in _LAST_GUARD_ERR[0]
+               else "Instagram is throttling reads right now, try again in 10-15 min" if _rate_limited(_LAST_GUARD_ERR[0])
                else "could not verify the thread (Instagram glitch), tap Approve again")
         state.update(cm["id"], status="flagged", reason=why)
         return None
@@ -521,7 +532,8 @@ def catchup_unanswered():
     time: open cards and comments recorded at first sight since CATCHUP_SINCE. Each one is checked live first."""
     n = 0
     t0 = time.time()
-    for row in state.backlog(config.CATCHUP_SINCE, config.CATCHUP_PER_POLL):
+    cooling = [t for t, until in list(_NODE_COOLDOWN.items()) if until > t0]   # they'd only take a slot from a row that can run
+    for row in state.backlog(config.CATCHUP_SINCE, config.CATCHUP_PER_POLL, cooling):
         if time.time() - t0 > config.CATCHUP_SECONDS:
             break
         state.set_kv("worker_beat", time.time())
@@ -561,7 +573,7 @@ def _catchup_one(row):
         try:
             thread = thread_of(top_id)
         except ig.IGError as e:
-            if "does not exist" in str(e):
+            if "does not exist" in str(e) and not isinstance(e, ig.PagingRefused):   # a page gone is not the comment gone
                 if state.update_if(row["id"], state.OPEN, status="deleted", reason="comment gone") and row.get("tg_msg_id"):
                     tg.delete(row["tg_msg_id"])
             else:

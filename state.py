@@ -239,11 +239,13 @@ def thread_answered_by_hand(top_id):
         return r is not None
 
 
-def backlog(since, limit):
+def backlog(since, limit, skip_threads=()):
     """Comments the bot never answered: open cards and comments recorded at first sight, newest first."""
+    skip = ",".join("?" * len(skip_threads))
     with _conn() as c:
         rows = c.execute("SELECT * FROM comments WHERE (status='preexisting' OR (status='flagged' AND needs_marcus=0)) "
-                         "AND username<>'imabgold' AND ts>=? ORDER BY ts DESC LIMIT ?", (since, limit)).fetchall()
+                         f"AND username<>'imabgold' AND ts>=? AND COALESCE(parent_id,id) NOT IN ({skip}) "
+                         "ORDER BY ts DESC LIMIT ?", (since, *skip_threads, limit)).fetchall()
         return [_d(r) for r in rows]
 
 
