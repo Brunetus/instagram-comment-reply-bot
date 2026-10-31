@@ -163,7 +163,7 @@ def already_answered(cm):
         thread = thread_of(top_id, fresh=True)
     except ig.IGError as e:
         _LAST_GUARD_ERR[0] = str(e)
-        if _node_limited(e):   # only this comment is throttled: verify through the reel instead
+        if _node_limited(e) and not isinstance(e, ig.PagingRefused):   # only this comment is throttled: verify through the reel instead
             v = _answered_via_media(cm)
             log(f"guard: node limited, checked via the reel instead -> {v}")
             return v
@@ -246,7 +246,9 @@ def _post_reply(cm, text, status):
     verdict = already_answered(cm)
     if verdict is None:
         # transient: keep the card live so Marcus can simply tap again
-        why = ("Instagram is throttling reads right now, try again in 10-15 min" if _rate_limited(_LAST_GUARD_ERR[0])
+        why = ("Instagram won't give me this whole thread, so I can't verify it for now. Reply in the app if it matters"
+               if "refused its next page" in _LAST_GUARD_ERR[0] or "paging failed" in _LAST_GUARD_ERR[0]
+               else "Instagram is throttling reads right now, try again in 10-15 min" if _rate_limited(_LAST_GUARD_ERR[0])
                else "could not verify the thread (Instagram glitch), tap Approve again")
         state.update(cm["id"], status="flagged", reason=why)
         return None
@@ -530,7 +532,7 @@ def catchup_unanswered():
     time: open cards and comments recorded at first sight since CATCHUP_SINCE. Each one is checked live first."""
     n = 0
     t0 = time.time()
-    cooling = [t for t, until in _NODE_COOLDOWN.items() if until > t0]   # they'd only take a slot from a row that can run
+    cooling = [t for t, until in list(_NODE_COOLDOWN.items()) if until > t0]   # they'd only take a slot from a row that can run
     for row in state.backlog(config.CATCHUP_SINCE, config.CATCHUP_PER_POLL, cooling):
         if time.time() - t0 > config.CATCHUP_SECONDS:
             break
