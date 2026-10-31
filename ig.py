@@ -1,10 +1,12 @@
 """Instagram Graph API, read + reply only. Every call is retried 3x. Nothing here hides or deletes."""
+import datetime as dt
 import json
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zoneinfo
 
 from . import config
 
@@ -32,6 +34,12 @@ def comments_blocked():
 
 def _is_throttle(msg):
     return re.search(r'"code":4\b', msg.replace(" ", "")) is not None or "request limit reached" in msg.lower()
+
+
+def _trip_breaker(path, msg):
+    _BLOCK["until"] = time.time() + BLOCK_SECONDS
+    sub = re.search(r'"error_subcode":\s*(\d+)', msg)
+    print(dt.datetime.now(zoneinfo.ZoneInfo(config.TZ)).strftime("%m-%d %H:%M:%S"), f"breaker tripped on {path.split('?')[0]}: subcode {sub.group(1) if sub else 'none'}", flush=True)
 
 
 def _error_body(e):
@@ -65,7 +73,7 @@ def _call(path, params, data=None):
             msg = _error_body(e)
             last = IGError(f"HTTP {e.code} on {path}: {msg}")
             if node_call and _is_throttle(msg):
-                _BLOCK["until"] = time.time() + BLOCK_SECONDS
+                _trip_breaker(path, msg)
             if e.code in (400, 403, 404):   # not transient (or a rate limit): retrying only deepens it
                 raise last
         except Exception as e:  # timeouts, connection resets
@@ -98,7 +106,7 @@ def _paginate(path, params, max_pages=None, stop=None):
             except urllib.error.HTTPError as e:   # same handling as _call: keep Instagram's words, never retry a refusal
                 msg = _error_body(e)
                 if _is_node_call(path) and _is_throttle(msg):
-                    _BLOCK["until"] = time.time() + BLOCK_SECONDS
+                    _trip_breaker(path, msg)
                 if e.code in (400, 403, 404):
                     raise PagingRefused(f"paging failed on {path}: HTTP {e.code}: {msg}")
                 failure = f"HTTP {e.code}: {msg}"
