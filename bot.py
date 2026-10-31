@@ -115,7 +115,10 @@ def thread_of(top_id, fresh=False):
             r["from"] = {"username": _author(r) or "?"}
             items.append(r)
     except ig.IGError as e:
-        if _node_limited(e):
+        if isinstance(e, ig.PagingRefused):   # a thread whose next page is refused trips the limit every time it's walked
+            _NODE_COOLDOWN[top_id] = now + 86400
+            log(f"thread {top_id} left alone for 24h: {e}")
+        elif _node_limited(e):
             _NODE_COOLDOWN[top_id] = now + 1800
         raise
     items = sorted(items, key=lambda c: c["timestamp"])
