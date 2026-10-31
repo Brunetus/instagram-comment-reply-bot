@@ -1,5 +1,6 @@
 """Instagram Graph API, read + reply only. Every call is retried 3x. Nothing here hides or deletes."""
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -30,7 +31,14 @@ def comments_blocked():
 
 
 def _is_throttle(msg):
-    return '"code":4' in msg.replace(" ", "") or "request limit reached" in msg.lower()
+    return re.search(r'"code":4\b', msg.replace(" ", "")) is not None or "request limit reached" in msg.lower()
+
+
+def _error_body(e):
+    try:
+        return e.read().decode(errors="replace")[:300]
+    except Exception:
+        return str(e)
 
 
 def _is_node_call(path):
@@ -54,7 +62,7 @@ def _call(path, params, data=None):
             with urllib.request.urlopen(url, data=body, timeout=25) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
-            msg = e.read().decode(errors="replace")[:300]
+            msg = _error_body(e)
             last = IGError(f"HTTP {e.code} on {path}: {msg}")
             if node_call and _is_throttle(msg):
                 _BLOCK["until"] = time.time() + BLOCK_SECONDS
@@ -88,7 +96,7 @@ def _paginate(path, params, max_pages=None, stop=None):
                     j = json.load(r)
                 break
             except urllib.error.HTTPError as e:   # same handling as _call: keep Instagram's words, never retry a refusal
-                msg = e.read().decode(errors="replace")[:300]
+                msg = _error_body(e)
                 if _is_node_call(path) and _is_throttle(msg):
                     _BLOCK["until"] = time.time() + BLOCK_SECONDS
                 if e.code in (400, 403, 404):
