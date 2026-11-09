@@ -51,11 +51,9 @@ RECONCILE_MAX = max(1, int(env("RECONCILE_MAX", "10")))     # newest open cards 
 SWEEP_MINUTES = int(env("SWEEP_MINUTES", "60"))    # every reel on the account is swept this often (hot 7 are every POLL_SECONDS)
 SWEEP_HOURS = int(env("SWEEP_HOURS", "48"))        # a sweep looks this far back on each reel
 POST_GAP_SECONDS = float(env("POST_GAP_SECONDS", "4"))
-# pinned cards = Marcus's review queue (2026-11-09). On the first run, open cards carded or touched up to this many days
-# ago get pinned; older ones are past the hourly answered-in-the-app check. Pins per sync are capped (unpins at 3x) so a
-# backlog trickles in.
-PIN_BACKFILL_DAYS = float(env("PIN_BACKFILL_DAYS", "7"))
-PIN_PER_RUN = max(1, int(env("PIN_PER_RUN", "10")))
+# pinned cards = Marcus's review queue (2026-11-09): every open card waiting on him, however old. Pins per sync are
+# capped (unpins at 3x) so a big backlog goes up over a few polls instead of in one burst.
+PIN_PER_RUN = max(1, int(env("PIN_PER_RUN", "25")))
 
 # shortcode:label, same four as track_reels.py
 # 2026-10-12 (Marcus): the localhost reel replaces "sexiest thing" (17 comments, quiet)

@@ -697,16 +697,12 @@ def _kv_json(k, empty):
 def sync_pins():
     """Pinned cards = Marcus's live review queue (Marcus, 2026-11-09): every card still waiting on him is pinned,
     and it is unpinned as soon as it is settled, whichever path settled it (tap, typed reply, catch-up, answered
-    in the app, deleted). Runs after every poll, sweep and tap; idempotent. A card is only newly pinned if it was
-    carded or touched after the first run minus PIN_BACKFILL_DAYS: older open cards are past the hourly in-app
-    check, so they may already be answered. Each message is handled on its own: a 400 refusal is retried for
+    in the app, deleted). Runs after every poll, sweep and tap; idempotent. The whole open backlog is pinned, however
+    old (Marcus, 2026-11-09): a card older than the weekly in-app check may already be answered, and a tap on it
+    stands down instead of double-posting, which takes it off the pins. Each message is handled on its own: a 400 refusal is retried for
     _PIN_TRIES runs and then given up, so one bad message never blocks the queue; anything else (429, 5xx, network)
     ends the run uncounted, so an outage never drops cards from the queue."""
     with _PIN_LOCK:
-        since = float(state.get_kv("pin_since", "0") or 0)
-        if not since:
-            since = time.time() - config.PIN_BACKFILL_DAYS * 86400
-            state.set_kv("pin_since", since)
         pinned = set(_kv_json("pinned", []))
         gone = set(_kv_json("pin_gone", []))   # messages never to try again (deleted card, or refused too often)
         maybe = set(_kv_json("pin_maybe", []))   # a pin that errored may still have landed: unpin it when settled
@@ -743,7 +739,7 @@ def sync_pins():
             finally:
                 save()
         new = [r["tg_msg_id"] for r in reversed(waiting)   # newest first: a fresh card never waits behind a backlog
-               if r["tg_msg_id"] not in pinned and r["tg_msg_id"] not in gone and (r.get("updated_at") or 0) >= since]
+               if r["tg_msg_id"] not in pinned and r["tg_msg_id"] not in gone]
         for mid in reversed(new[:min(config.PIN_PER_RUN, budget)]):   # the newest is pinned last, so it sits on top
             maybe.add(mid); save()   # recorded first: a pin that lands but times out is still unpinned later
             try:
