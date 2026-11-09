@@ -677,6 +677,54 @@ def reconcile_open_cards(force=False):
     return n
 
 
+_PIN_LOCK = threading.Lock()
+
+
+def _waiting_on_marcus(row):
+    """A card only Marcus can settle: open, carded, held for him (not queued to retry, not left for the catch-up)."""
+    why = row.get("reason") or ""
+    return (row["status"] == "flagged" and row.get("tg_msg_id") and (row.get("needs_marcus") or not config.AUTO_DRAFT)
+            and not why.startswith(("queued", "backfill")))
+
+
+def sync_pins():
+    """Pinned cards = Marcus's live review queue (Marcus, 2026-11-09): every card still waiting on him is pinned,
+    and it is unpinned as soon as it is settled, whichever path settled it (tap, typed reply, catch-up, answered
+    in the app, deleted). Runs after every poll and after each tap; idempotent. Cards older than the first run
+    (minus PIN_BACKFILL_DAYS) are never newly pinned: older ones are past the hourly in-app check, so they may
+    already be answered."""
+    with _PIN_LOCK:
+        since = float(state.get_kv("pin_since", "0") or 0)
+        if not since:
+            since = time.time() - config.PIN_BACKFILL_DAYS * 86400
+            state.set_kv("pin_since", since)
+        pinned = set(json.loads(state.get_kv("pinned", "[]") or "[]"))
+        gone = set(json.loads(state.get_kv("pin_gone", "[]") or "[]"))   # card messages Telegram no longer has
+        waiting = [r for r in state.rows(status="flagged") if _waiting_on_marcus(r)]
+        keep = {r["tg_msg_id"] for r in waiting}
+        for mid in sorted(pinned - keep):
+            tg.unpin(mid)
+            pinned.discard(mid)
+            state.set_kv("pinned", json.dumps(sorted(pinned)))
+        new = [r["tg_msg_id"] for r in waiting
+               if r["tg_msg_id"] not in pinned and r["tg_msg_id"] not in gone and (r.get("created_at") or 0) >= since]
+        for mid in new[:config.PIN_PER_RUN]:   # oldest first, so the newest card is the one on top
+            if tg.pin(mid):
+                pinned.add(mid)
+                state.set_kv("pinned", json.dumps(sorted(pinned)))
+            else:
+                gone.add(mid)
+                state.set_kv("pin_gone", json.dumps(sorted(gone)))
+        return len(pinned)
+
+
+def _sync_pins_safely():
+    try:
+        sync_pins()
+    except Exception as e:
+        log("pins: sync failed", repr(e)[:160])
+
+
 BACKFILL = os.path.join(os.path.dirname(__file__), "backfill.json")
 
 
@@ -941,8 +989,10 @@ def handle_update(u):
             return
         with _POST_LOCK:   # the worker may be posting this very row: one of us settles it, the other sees that
             _handle_tap(code, cid, row, cb)
+        _sync_pins_safely()   # a settled card comes off the pinned queue right away
         return
     _handle_text(u)
+    _sync_pins_safely()
 
 
 def _handle_tap(code, cid, row, cb):
@@ -1141,6 +1191,7 @@ def _ig_worker():
                         catchup_unanswered()
                     else:
                         log(f"comment calls paused by Instagram's limit, resuming in {int(ig._BLOCK['until'] - time.time())//60} min")
+                _sync_pins_safely()   # Telegram only, so it runs even while Instagram has paused comment calls
             # 2) whole-account sweep every SWEEP_MINUTES, or now on /sweep
             if _SWEEP_NOW.is_set() or time.time() >= next_sweep:
                 asked = _SWEEP_NOW.is_set()

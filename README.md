@@ -43,5 +43,6 @@ Shows how the last 2 days of real comments would have been tiered and drafts 5 f
 
 ## Telegram
 `/status` `/pause` `/resume` `/sweep` `/help`. Tap Edit on a card, then just type your text as the next message to post that instead of the draft (replying directly to the card works too).
+Pinned cards are the review queue: every card still waiting on Marcus is pinned (silently), and it is unpinned as soon as it is settled by a tap, a typed reply, the catch-up, an answer in the app, or a deletion.
 `/pause` stops reading comments and auto-posting; your own taps and typed replies still post while paused.
 `AUTO_POST` defaults to `0` (shadow) if the variable is missing, so a misconfigured deploy never auto-posts.
