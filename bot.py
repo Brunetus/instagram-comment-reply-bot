@@ -699,8 +699,9 @@ def sync_pins():
     and it is unpinned as soon as it is settled, whichever path settled it (tap, typed reply, catch-up, answered
     in the app, deleted). Runs after every poll, sweep and tap; idempotent. A card is only newly pinned if it was
     carded or touched after the first run minus PIN_BACKFILL_DAYS: older open cards are past the hourly in-app
-    check, so they may already be answered. Each message is handled on its own: a 429 ends the run, any other
-    refusal is retried for _PIN_TRIES runs and then given up, so one bad message never blocks the queue."""
+    check, so they may already be answered. Each message is handled on its own: a 400 refusal is retried for
+    _PIN_TRIES runs and then given up, so one bad message never blocks the queue; anything else (429, 5xx, network)
+    ends the run uncounted, so an outage never drops cards from the queue."""
     with _PIN_LOCK:
         since = float(state.get_kv("pin_since", "0") or 0)
         if not since:
@@ -718,8 +719,8 @@ def sync_pins():
             state.set_kv("pin_fails", json.dumps({str(k): v for k, v in fails.items()}))
 
         def failed(mid, e):   # True = stop this run
-            if "429" in str(e) or "too many requests" in str(e).lower():
-                log("pins: Telegram rate limit, resuming next run"); return True
+            if not (isinstance(e, RuntimeError) and "HTTP 400" in str(e)):   # 429, 5xx, network: not this message's fault
+                log("pins: Telegram unavailable, resuming next run:", repr(e)[:120]); return True
             fails[mid] = fails.get(mid, 0) + 1
             log(f"pins: Telegram refused message {mid} ({fails[mid]}/{_PIN_TRIES}):", str(e)[:120])
             if fails[mid] >= _PIN_TRIES:
@@ -743,7 +744,7 @@ def sync_pins():
                 save()
         new = [r["tg_msg_id"] for r in reversed(waiting)   # newest first: a fresh card never waits behind a backlog
                if r["tg_msg_id"] not in pinned and r["tg_msg_id"] not in gone and (r.get("updated_at") or 0) >= since]
-        for mid in new[:min(config.PIN_PER_RUN, budget)]:
+        for mid in reversed(new[:min(config.PIN_PER_RUN, budget)]):   # the newest is pinned last, so it sits on top
             maybe.add(mid); save()   # recorded first: a pin that lands but times out is still unpinned later
             try:
                 if tg.pin(mid):
