@@ -678,43 +678,84 @@ def reconcile_open_cards(force=False):
 
 
 _PIN_LOCK = threading.Lock()
+_PIN_TRIES = 3   # a message Telegram keeps refusing for another reason is given up on after this many runs
 
 
 def _waiting_on_marcus(row):
-    """A card only Marcus can settle: open, carded, held for him (not queued to retry, not left for the catch-up)."""
-    why = row.get("reason") or ""
+    """A card only Marcus can settle: open, carded, held for him, and not on the retry queue (the bot posts those)."""
     return (row["status"] == "flagged" and row.get("tg_msg_id") and (row.get("needs_marcus") or not config.AUTO_DRAFT)
-            and not why.startswith(("queued", "backfill")))
+            and not (row.get("reason") or "").startswith("backfill") and not state.get_kv(f"retry:{row['id']}"))
+
+
+def _kv_json(k, empty):
+    try:
+        return json.loads(state.get_kv(k) or "null") or empty
+    except ValueError:
+        return empty
 
 
 def sync_pins():
     """Pinned cards = Marcus's live review queue (Marcus, 2026-11-09): every card still waiting on him is pinned,
     and it is unpinned as soon as it is settled, whichever path settled it (tap, typed reply, catch-up, answered
-    in the app, deleted). Runs after every poll and after each tap; idempotent. Cards older than the first run
-    (minus PIN_BACKFILL_DAYS) are never newly pinned: older ones are past the hourly in-app check, so they may
-    already be answered."""
+    in the app, deleted). Runs after every poll, sweep and tap; idempotent. A card is only newly pinned if it was
+    carded or touched after the first run minus PIN_BACKFILL_DAYS: older open cards are past the hourly in-app
+    check, so they may already be answered. Each message is handled on its own: a 429 ends the run, any other
+    refusal is retried for _PIN_TRIES runs and then given up, so one bad message never blocks the queue."""
     with _PIN_LOCK:
         since = float(state.get_kv("pin_since", "0") or 0)
         if not since:
             since = time.time() - config.PIN_BACKFILL_DAYS * 86400
             state.set_kv("pin_since", since)
-        pinned = set(json.loads(state.get_kv("pinned", "[]") or "[]"))
-        gone = set(json.loads(state.get_kv("pin_gone", "[]") or "[]"))   # card messages Telegram no longer has
+        pinned = set(_kv_json("pinned", []))
+        gone = set(_kv_json("pin_gone", []))   # messages never to try again (deleted card, or refused too often)
+        maybe = set(_kv_json("pin_maybe", []))   # a pin that errored may still have landed: unpin it when settled
+        fails = {int(k): v for k, v in _kv_json("pin_fails", {}).items()}
+
+        def save():
+            state.set_kv("pinned", json.dumps(sorted(pinned)))
+            state.set_kv("pin_maybe", json.dumps(sorted(maybe)))
+            state.set_kv("pin_gone", json.dumps(sorted(gone)))
+            state.set_kv("pin_fails", json.dumps({str(k): v for k, v in fails.items()}))
+
+        def failed(mid, e):   # True = stop this run
+            if "429" in str(e) or "too many requests" in str(e).lower():
+                log("pins: Telegram rate limit, resuming next run"); return True
+            fails[mid] = fails.get(mid, 0) + 1
+            log(f"pins: Telegram refused message {mid} ({fails[mid]}/{_PIN_TRIES}):", str(e)[:120])
+            if fails[mid] >= _PIN_TRIES:
+                pinned.discard(mid); maybe.discard(mid); gone.add(mid); fails.pop(mid, None)
+            return False
+
         waiting = [r for r in state.rows(status="flagged") if _waiting_on_marcus(r)]
         keep = {r["tg_msg_id"] for r in waiting}
-        for mid in sorted(pinned - keep):
-            tg.unpin(mid)
-            pinned.discard(mid)
-            state.set_kv("pinned", json.dumps(sorted(pinned)))
-        new = [r["tg_msg_id"] for r in waiting
-               if r["tg_msg_id"] not in pinned and r["tg_msg_id"] not in gone and (r.get("created_at") or 0) >= since]
-        for mid in new[:config.PIN_PER_RUN]:   # oldest first, so the newest card is the one on top
-            if tg.pin(mid):
-                pinned.add(mid)
-                state.set_kv("pinned", json.dumps(sorted(pinned)))
-            else:
-                gone.add(mid)
-                state.set_kv("pin_gone", json.dumps(sorted(gone)))
+        budget = config.PIN_PER_RUN * 3   # unpins too, so a mass settle can't burst into Telegram's limit
+        for mid in sorted((pinned | maybe) - keep):
+            if budget <= 0:
+                break
+            budget -= 1
+            try:
+                tg.unpin(mid)
+                pinned.discard(mid); maybe.discard(mid); fails.pop(mid, None)
+            except Exception as e:
+                if failed(mid, e):
+                    break
+            finally:
+                save()
+        new = [r["tg_msg_id"] for r in reversed(waiting)   # newest first: a fresh card never waits behind a backlog
+               if r["tg_msg_id"] not in pinned and r["tg_msg_id"] not in gone and (r.get("updated_at") or 0) >= since]
+        for mid in new[:min(config.PIN_PER_RUN, budget)]:
+            maybe.add(mid); save()   # recorded first: a pin that lands but times out is still unpinned later
+            try:
+                if tg.pin(mid):
+                    pinned.add(mid)
+                else:   # card message is gone: nothing to pin
+                    gone.add(mid)
+                maybe.discard(mid); fails.pop(mid, None)
+            except Exception as e:
+                if failed(mid, e):   # stays in maybe: pinned again next run while waiting, unpinned once settled
+                    break
+            finally:
+                save()
         return len(pinned)
 
 
@@ -987,12 +1028,16 @@ def handle_update(u):
             pass
         if not live:
             return
-        with _POST_LOCK:   # the worker may be posting this very row: one of us settles it, the other sees that
-            _handle_tap(code, cid, row, cb)
-        _sync_pins_safely()   # a settled card comes off the pinned queue right away
+        try:
+            with _POST_LOCK:   # the worker may be posting this very row: one of us settles it, the other sees that
+                _handle_tap(code, cid, row, cb)
+        finally:
+            _sync_pins_safely()   # a settled card comes off the pinned queue right away
         return
-    _handle_text(u)
-    _sync_pins_safely()
+    try:
+        _handle_text(u)
+    finally:
+        _sync_pins_safely()
 
 
 def _handle_tap(code, cid, row, cb):
@@ -1182,16 +1227,18 @@ def _ig_worker():
             # 1) Instagram poll
             if time.time() >= next_poll:
                 next_poll = time.time() + config.POLL_SECONDS
-                if not _paused():
-                    state.set_kv("poll_no", int(state.get_kv("poll_no", "0")) + 1)
-                    poll_once()
-                    if not ig.comments_blocked():
-                        reconcile_open_cards()
-                        retry_queued()
-                        catchup_unanswered()
-                    else:
-                        log(f"comment calls paused by Instagram's limit, resuming in {int(ig._BLOCK['until'] - time.time())//60} min")
-                _sync_pins_safely()   # Telegram only, so it runs even while Instagram has paused comment calls
+                try:
+                    if not _paused():
+                        state.set_kv("poll_no", int(state.get_kv("poll_no", "0")) + 1)
+                        poll_once()
+                        if not ig.comments_blocked():
+                            reconcile_open_cards()
+                            retry_queued()
+                            catchup_unanswered()
+                        else:
+                            log(f"comment calls paused by Instagram's limit, resuming in {int(ig._BLOCK['until'] - time.time())//60} min")
+                finally:
+                    _sync_pins_safely()   # Telegram only: runs even when Instagram paused comment calls or the poll failed
             # 2) whole-account sweep every SWEEP_MINUTES, or now on /sweep
             if _SWEEP_NOW.is_set() or time.time() >= next_sweep:
                 asked = _SWEEP_NOW.is_set()
@@ -1207,6 +1254,8 @@ def _ig_worker():
                         if asked:
                             tg.send(f"sweep failed: {type(e).__name__}: {str(e)[:150]}")
                         raise
+                    finally:
+                        _sync_pins_safely()
                     if asked:
                         tg.send(f"sweep done, {n} new comments handled")
             # 3) daily digest

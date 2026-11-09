@@ -54,7 +54,7 @@ def delete(msg_id):
 def pin(msg_id):
     """Pin a card silently. Returns False if the message is gone (deleted card), raises on anything else."""
     try:
-        _call("pinChatMessage", {"chat_id": config.TG_CHAT, "message_id": msg_id, "disable_notification": True})
+        _call("pinChatMessage", {"chat_id": config.TG_CHAT, "message_id": msg_id, "disable_notification": True}, timeout=15)
         return True
     except RuntimeError as e:
         if "not found" in str(e).lower():
@@ -65,7 +65,7 @@ def pin(msg_id):
 def unpin(msg_id):
     """Unpin one card. A message that is gone or no longer pinned counts as unpinned."""
     try:
-        _call("unpinChatMessage", {"chat_id": config.TG_CHAT, "message_id": msg_id})
+        _call("unpinChatMessage", {"chat_id": config.TG_CHAT, "message_id": msg_id}, timeout=15)
     except RuntimeError as e:
         if "not found" not in str(e).lower() and "not pinned" not in str(e).lower():
             raise
