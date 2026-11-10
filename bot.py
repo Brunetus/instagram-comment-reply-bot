@@ -296,24 +296,27 @@ def _queue_retry(cid, text, status):
 def retry_queued(limit=5):
     """Replies Instagram throttled: post them when their time comes (same guard as any post). Gives up after 8 tries."""
     n = 0
-    backfill_done = False
+    bf_n, bf_stop = 0, False   # backfill replies posted this poll; stop the burst at the first one that doesn't post
     for k, raw in state.kv_prefix("retry:"):
-        if n >= limit or not raw:
+        if not raw:
             continue
         try:
             job = json.loads(raw)
         except ValueError:
             state.set_kv(k, ""); continue
-        if job.get("at", 0) > time.time():
-            continue
         cid = k.split(":", 1)[1]
         row = state.get(cid)
         if not row or row["status"] != "flagged":
             state.set_kv(k, ""); continue
-        if (row.get("reason") or "").startswith("backfill"):
-            if backfill_done:   # at most one backfill reply per poll, however overdue the queue is
+        is_bf = (row.get("reason") or "").startswith("backfill")
+        if is_bf:
+            # 2026-11-10 (Marcus): approved backfill replies go out BACKFILL_GAP seconds apart, BACKFILL_PER_POLL per
+            # poll, instead of one per 10 min. The first try ignores the old staggered schedule; a re-try after a
+            # throttle still waits its backoff.
+            if bf_stop or bf_n >= config.BACKFILL_PER_POLL or (int(job.get("tries", 0)) and job.get("at", 0) > time.time()):
                 continue
-            backfill_done = True
+        elif n >= limit or job.get("at", 0) > time.time():
+            continue
         if int(job.get("tries", 0)) >= 8:
             state.set_kv(k, "")
             # 2026-11-09: back to an open card waiting on Marcus (not "error"), so it is pinned again and a later
@@ -325,11 +328,18 @@ def retry_queued(limit=5):
             else:   # no card to reopen: counted as an error in the digest, as before
                 state.update_if(cid, ("flagged",), status="error", reason="gave up after 8 tries")
             continue
-        n += 1
+        if is_bf:
+            if bf_n:
+                time.sleep(config.BACKFILL_GAP)
+            bf_n += 1
+        else:
+            n += 1
         try:
             rid = post_reply(row, job["text"], job["status"])
         except Exception as e:
-            log("retry failed", repr(e)[:120]); state.set_kv(k, ""); continue
+            log("retry failed", repr(e)[:120]); state.set_kv(k, ""); bf_stop = bf_stop or is_bf; continue
+        if is_bf and not rid:
+            bf_stop = True
         if not rid and state.get_kv(k) == raw and (state.get(cid) or {}).get("status") == "flagged":
             _queue_retry(cid, job["text"], job["status"])   # stood down without re-queueing (glitch, refusal): count the try
         if rid and row.get("tg_msg_id"):
@@ -802,10 +812,10 @@ def load_backfill():
                                reason="backfill: reply Marcus approved for a comment the bot had skipped"):
             continue   # not in the db, or already answered some other way
         state.set_kv(f"retry:{e['cid']}", json.dumps({"text": e["reply"], "status": "approved_posted", "tries": 0,
-                                                      "at": time.time() + 600 * n}))   # one every 10 min
+                                                      "at": time.time() + config.BACKFILL_GAP * n}))
         n += 1
     state.set_kv("backfill_loaded", tag)
-    log(f"backfill: queued {n} approved replies, one every 10 min")
+    log(f"backfill: queued {n} approved replies, {config.BACKFILL_GAP:g}s apart")
     return n
 
 
