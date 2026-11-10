@@ -183,7 +183,7 @@ def already_answered(cm, strict=False):
         a = (c.get("from") or {}).get("username")
         if a != ME if strict else a not in (ME, "?", None):
             continue
-        # a == ME, or unknown (treated as Marcus: fail closed)
+        # a == ME, or (not strict) unknown, treated as Marcus: fail closed
         if not cm.get("parent_id") or c["timestamp"] > cm["timestamp"]:
             return True
     return False
@@ -318,10 +318,12 @@ def retry_queued(limit=5):
             state.set_kv(k, "")
             # 2026-11-09: back to an open card waiting on Marcus (not "error"), so it is pinned again and a later
             # Approve tap is accepted instead of answering "already handled"
-            state.update_if(cid, ("flagged",), needs_marcus=1, reason="gave up after 8 tries")
             if row.get("tg_msg_id"):
-                tg.send(f"⚠️ couldn't post to @{row['username']} after 8 tries. Tap Approve again later.",
-                        reply_to=row["tg_msg_id"])
+                state.update_if(cid, ("flagged",), needs_marcus=1, reason="gave up after 8 tries")
+                tg.send(f"⚠️ couldn't post to @{row['username']} after 8 tries. Tap Approve to post the draft shown, "
+                        "or Edit and send your text again.", reply_to=row["tg_msg_id"])
+            else:   # no card to reopen: counted as an error in the digest, as before
+                state.update_if(cid, ("flagged",), status="error", reason="gave up after 8 tries")
             continue
         n += 1
         try:
