@@ -640,9 +640,15 @@ def reconcile_open_cards(force=False):
     if not force and int(state.get_kv("poll_no", "0")) % config.RECONCILE_EVERY:   # /reconcile runs it now
         return 0
     week = time.time() - 7 * 86400
-    cards = [r for r in state.rows(status="flagged")   # no card = nothing to take down; old cards not worth the calls
-             if (r.get("created_at") or 0) >= week and r.get("tg_msg_id")]
-    for row in reversed(cards[-config.RECONCILE_MAX:]):
+    flagged = [r for r in state.rows(status="flagged") if r.get("tg_msg_id")]   # no card = nothing to take down
+    cards = [r for r in flagged if (r.get("created_at") or 0) >= week]
+    # 2026-11-09: cards older than a week were never re-checked, so the ones Marcus had already answered in the app
+    # stayed pinned in his review queue (13 of 20 sampled). A few of those per run too, least recently checked first.
+    old = sorted((r for r in flagged if (r.get("created_at") or 0) < week and _waiting_on_marcus(r)),
+                 key=lambda r: float(state.get_kv(f"rc_at:{r['id']}") or 0))[:config.RECONCILE_MAX]
+    for row in list(reversed(cards[-config.RECONCILE_MAX:])) + old:
+        if (row.get("created_at") or 0) < week:
+            state.set_kv(f"rc_at:{row['id']}", str(time.time()))
         try:
             verdict = already_answered(row)
         except Exception as e:
@@ -782,7 +788,9 @@ def load_backfill():
             continue
         if content_violation(e["reply"]):
             log(f"backfill: refused @{e.get('user')} ({content_violation(e['reply'])})"); continue
-        if not state.update_if(e["cid"], ("skipped", "signoff"), status="flagged", draft=e["reply"], needs_marcus=1,
+        # flagged = an open card Marcus approved a reply for in chat (2026-11-09 pinned-queue pass): same retry path,
+        # and the backfill reason takes it off the pins at once
+        if not state.update_if(e["cid"], ("skipped", "signoff", "flagged"), status="flagged", draft=e["reply"], needs_marcus=1,
                                reason="backfill: reply Marcus approved for a comment the bot had skipped"):
             continue   # not in the db, or already answered some other way
         state.set_kv(f"retry:{e['cid']}", json.dumps({"text": e["reply"], "status": "approved_posted", "tries": 0,
