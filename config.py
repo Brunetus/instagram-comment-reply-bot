@@ -54,6 +54,9 @@ POST_GAP_SECONDS = float(env("POST_GAP_SECONDS", "4"))
 # pinned cards = Marcus's review queue (2026-11-09): every open card waiting on him, however old. Pins per sync are
 # capped (unpins at 3x) so a big backlog goes up over a few polls instead of in one burst.
 PIN_PER_RUN = max(1, int(env("PIN_PER_RUN", "25")))
+# approved backfill replies (2026-11-10, Marcus: "one every 10 seconds, not minutes"): this far apart, this many per poll
+BACKFILL_GAP = max(5.0, float(env("BACKFILL_GAP", "10")))
+BACKFILL_PER_POLL = max(1, int(env("BACKFILL_PER_POLL", "40")))
 
 # shortcode:label, same four as track_reels.py
 # 2026-10-12 (Marcus): the localhost reel replaces "sexiest thing" (17 comments, quiet)
