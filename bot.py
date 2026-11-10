@@ -132,9 +132,9 @@ def thread_of(top_id, fresh=False):
     return [dict(c) for c in items]
 
 
-def _answered_via_media(cm):
+def _answered_via_media(cm, strict=False):
     """Fallback when the comment node itself is rate-limited: read the newest comments of the REEL (a different node)
-    plus what the poll has stored. True/False, or None if that fails too."""
+    plus what the poll has stored. True/False, or None if that fails too. strict: see already_answered."""
     top_id = cm.get("parent_id") or cm["id"]
     media_id = cm.get("media_id")
     if not media_id:
@@ -148,23 +148,24 @@ def _answered_via_media(cm):
         if c["id"] == cm["id"] or (c.get("parent_id") or c["id"]) != top_id:
             continue
         a = (c.get("from") or {}).get("username")
-        if a in (ME, "?", None) and (not cm.get("parent_id") or (c.get("timestamp") or "") > cm["timestamp"]):
+        if (a == ME if strict else a in (ME, "?", None)) and (not cm.get("parent_id") or (c.get("timestamp") or "") > cm["timestamp"]):
             return True
     return False
 
 
-def already_answered(cm):
+def already_answered(cm, strict=False):
     """True  = Marcus (or this bot) already replied after this comment in its thread, stand down.
        False = clear to post.
        None  = could not verify (API error / deleted comment), stand down.
-    Re-fetched live every time, never from cache."""
+    Re-fetched live every time, never from cache. A reply whose author Instagram won't name counts as Marcus (fail
+    closed before a post); strict=True counts only a confirmed @imabgold reply, for taking a card off the queue."""
     top_id = cm.get("parent_id") or cm["id"]
     try:
         thread = thread_of(top_id, fresh=True)
     except ig.IGError as e:
         _LAST_GUARD_ERR[0] = str(e)
         if _node_limited(e) and not isinstance(e, ig.PagingRefused):   # only this comment is throttled: verify through the reel instead
-            v = _answered_via_media(cm)
+            v = _answered_via_media(cm, strict)
             log(f"guard: node limited, checked via the reel instead -> {v}")
             return v
         log("guard: could not fetch thread:", str(e)[:160])
@@ -180,9 +181,9 @@ def already_answered(cm):
         if c["id"] == cm["id"]:
             continue
         a = (c.get("from") or {}).get("username")
-        if a not in (ME, "?", None):
+        if a != ME if strict else a not in (ME, "?", None):
             continue
-        # a == ME, or unknown (treated as Marcus: fail closed)
+        # a == ME, or (not strict) unknown, treated as Marcus: fail closed
         if not cm.get("parent_id") or c["timestamp"] > cm["timestamp"]:
             return True
     return False
@@ -315,10 +316,14 @@ def retry_queued(limit=5):
             backfill_done = True
         if int(job.get("tries", 0)) >= 8:
             state.set_kv(k, "")
-            state.update_if(cid, ("flagged",), status="error", reason="gave up after 8 tries")
+            # 2026-11-09: back to an open card waiting on Marcus (not "error"), so it is pinned again and a later
+            # Approve tap is accepted instead of answering "already handled"
             if row.get("tg_msg_id"):
-                tg.send(f"⚠️ gave up on @{row['username']} after 8 tries, Instagram kept throttling. Tap Approve again later.",
-                        reply_to=row["tg_msg_id"])
+                state.update_if(cid, ("flagged",), needs_marcus=1, reason="gave up after 8 tries")
+                tg.send(f"⚠️ couldn't post to @{row['username']} after 8 tries. Tap Approve to post the draft shown, "
+                        "or Edit and send your text again.", reply_to=row["tg_msg_id"])
+            else:   # no card to reopen: counted as an error in the digest, as before
+                state.update_if(cid, ("flagged",), status="error", reason="gave up after 8 tries")
             continue
         n += 1
         try:
@@ -640,11 +645,20 @@ def reconcile_open_cards(force=False):
     if not force and int(state.get_kv("poll_no", "0")) % config.RECONCILE_EVERY:   # /reconcile runs it now
         return 0
     week = time.time() - 7 * 86400
-    cards = [r for r in state.rows(status="flagged")   # no card = nothing to take down; old cards not worth the calls
-             if (r.get("created_at") or 0) >= week and r.get("tg_msg_id")]
-    for row in reversed(cards[-config.RECONCILE_MAX:]):
+    flagged = [r for r in state.rows(status="flagged") if r.get("tg_msg_id")]   # no card = nothing to take down
+    cards = [r for r in flagged if (r.get("created_at") or 0) >= week]
+    # 2026-11-09: cards older than a week were never re-checked, so the ones Marcus had already answered in the app
+    # stayed pinned in his review queue (13 of 20 sampled). A few of those per run too, least recently checked first.
+    old = sorted((r for r in flagged if (r.get("created_at") or 0) < week and _waiting_on_marcus(r)),
+                 key=lambda r: float(state.get_kv(f"rc_at:{r['id']}") or 0))[:config.RECONCILE_MAX]
+    t0 = time.time()
+    for row in list(reversed(cards[-config.RECONCILE_MAX:])) + old:
+        if time.time() - t0 > config.CATCHUP_SECONDS:   # same wall-clock cap as catch-up: polling and retries come first
+            log("reconcile: time cap reached, resuming next run"); break
+        if (row.get("created_at") or 0) < week:
+            state.set_kv(f"rc_at:{row['id']}", str(time.time()))
         try:
-            verdict = already_answered(row)
+            verdict = already_answered(row, strict=True)   # an unnamed replier is not proof he answered
         except Exception as e:
             log("reconcile: stopped:", repr(e)[:120]); break
         if verdict is None and _rate_limited(_LAST_GUARD_ERR[0]) and not _node_limited(_LAST_GUARD_ERR[0]):
@@ -782,7 +796,9 @@ def load_backfill():
             continue
         if content_violation(e["reply"]):
             log(f"backfill: refused @{e.get('user')} ({content_violation(e['reply'])})"); continue
-        if not state.update_if(e["cid"], ("skipped", "signoff"), status="flagged", draft=e["reply"], needs_marcus=1,
+        # flagged = an open card Marcus approved a reply for in chat (2026-11-09 pinned-queue pass): same retry path,
+        # and the backfill reason takes it off the pins at once
+        if not state.update_if(e["cid"], ("skipped", "signoff", "flagged"), status="flagged", draft=e["reply"], needs_marcus=1,
                                reason="backfill: reply Marcus approved for a comment the bot had skipped"):
             continue   # not in the db, or already answered some other way
         state.set_kv(f"retry:{e['cid']}", json.dumps({"text": e["reply"], "status": "approved_posted", "tries": 0,
