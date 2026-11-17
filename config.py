@@ -32,8 +32,12 @@ TG_CHAT = str(env("TELEGRAM_CHAT_ID", ""))
 
 ANTHROPIC_KEY = env("ANTHROPIC_API_KEY", "")
 DRAFT_MODEL = env("DRAFT_MODEL", "claude-opus-5-5")
-DRAFT_EFFORT = env("DRAFT_EFFORT", "high")   # 2026-10-19: API credits are included with Max, so think harder
-WEB_SEARCHES = int(env("WEB_SEARCHES", "2"))   # web searches the drafter may run per draft; 0 disables
+# 2026-11-17: back to medium (was "high" since 2026-10-19). The included API credits ran low before the monthly
+# reload, and a comment reply does not need the extra thinking. Set DRAFT_EFFORT=high on Railway to undo.
+DRAFT_EFFORT = env("DRAFT_EFFORT", "medium")
+# web searches the drafter may run per draft. 2026-11-17: 1 (was 2). Not 0: the drafter's prompt tells it to look
+# facts up instead of guessing, so with no search tool it would guess.
+WEB_SEARCHES = int(env("WEB_SEARCHES", "1"))
 
 DATA_DIR = env("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 POLL_SECONDS = int(env("POLL_SECONDS", "600"))
