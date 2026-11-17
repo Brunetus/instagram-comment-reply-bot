@@ -411,15 +411,16 @@ def _posted_card(cm, thread, label, d, posted, why, edit_msg_id=None):
 def auto_or_flag(row, cm, thread, m, label, edit_msg_id=None):
     """The flag tier since 2026-10-25: draft, let the critic judge, post on its own or hand Marcus a card."""
     caption = m.get("caption") or ""
-    d = draft.draft(cm, thread, caption, label)
     text = cm.get("text") or ""
     top_id = cm.get("parent_id") or cm["id"]
     if not config.AUTO_DRAFT:   # tier off: plain card, NOT marked as a hold, so it is caught up once the tier is on
         if not edit_msg_id:
-            flag_to_marcus(row, thread, label, caption, pre=d)
-        else:
+            flag_to_marcus(row, thread, label, caption, pre=draft.draft(cm, thread, caption, label))
+        else:   # the card already carries its draft. The catch-up comes back here every poll while the tier is
+            # off, so drafting before this check paid for a new draft per open card per poll (2026-11-17).
             state.update_if(cm["id"], state.OPEN, status="flagged")
         return
+    d = draft.draft(cm, thread, caption, label)
     stripped = classify._MENTION.sub("", text)
     by_hand = any((c.get("from") or {}).get("username") in (ME, "?", None) and c["id"] != cm["id"]
                   and not state.is_bot_reply(c["id"]) for c in thread)   # a reply of his the bot did not post
